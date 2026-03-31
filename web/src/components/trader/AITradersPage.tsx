@@ -18,6 +18,7 @@ import { TelegramConfigModal } from './TelegramConfigModal'
 import { ModelConfigModal } from './ModelConfigModal'
 import { ConfigStatusGrid } from './ConfigStatusGrid'
 import { TradersList } from './TradersList'
+import { BeginnerGuideCards } from './BeginnerGuideCards'
 import {
   Bot,
   Plus,
@@ -25,6 +26,12 @@ import {
 } from 'lucide-react'
 import { confirmToast } from '../../lib/notify'
 import { toast } from 'sonner'
+import {
+  getBeginnerWalletAddress,
+  getUserMode,
+  setBeginnerWalletAddress as persistBeginnerWalletAddress,
+} from '../../lib/onboarding'
+import type { Strategy } from '../../types'
 
 interface AITradersPageProps {
   onTraderSelect?: (traderId: string) => void
@@ -48,6 +55,14 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
   const [visibleTraderAddresses, setVisibleTraderAddresses] = useState<Set<string>>(new Set())
   const [visibleExchangeAddresses, setVisibleExchangeAddresses] = useState<Set<string>>(new Set())
   const [copiedId, setCopiedId] = useState<string | null>(null)
+  const [quickSetupLoading, setQuickSetupLoading] = useState(false)
+  const [beginnerWalletAddress, setBeginnerWalletAddress] = useState<string | null>(() => getBeginnerWalletAddress())
+  const isBeginnerMode = getUserMode() === 'beginner'
+
+  const navigateInApp = (path: string) => {
+    navigate(path)
+    window.dispatchEvent(new PopStateEvent('popstate'))
+  }
 
   // Toggle wallet address visibility for a trader
   const toggleTraderAddressVisibility = (traderId: string) => {
@@ -91,6 +106,11 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
     api.getTraders,
     { refreshInterval: 5000 }
   )
+  const { data: strategies } = useSWR<Strategy[]>(
+    user && token ? 'strategies' : null,
+    api.getStrategies,
+    { refreshInterval: 30000 }
+  )
 
   useEffect(() => {
     const loadConfigs = async () => {
@@ -115,6 +135,12 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
           api.getSupportedModels(),
         ])
         setAllModels(modelConfigs)
+        const clawWalletAddress =
+          modelConfigs.find((model) => model.provider === 'claw402')?.walletAddress || null
+        if (clawWalletAddress) {
+          setBeginnerWalletAddress(clawWalletAddress)
+          persistBeginnerWalletAddress(clawWalletAddress)
+        }
         setAllExchanges(exchangeConfigs)
         setSupportedModels(models)
       } catch (error) {
@@ -211,11 +237,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
         return
       }
 
-      await toast.promise(api.createTrader(data), {
-        loading: t('aiTradersToast.creating', language),
-        success: t('aiTradersToast.created', language),
-        error: t('aiTradersToast.createFailed', language),
-      })
+      await api.createTrader(data)
+      toast.success(t('aiTradersToast.created', language))
       setShowCreateModal(false)
       await mutateTraders()
     } catch (error) {
@@ -268,11 +291,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
       console.log('🔥 handleSaveEditTrader - data.strategy_id:', data.strategy_id)
       console.log('🔥 handleSaveEditTrader - request:', request)
 
-      await toast.promise(api.updateTrader(editingTrader.trader_id, request), {
-        loading: t('aiTradersToast.saving', language),
-        success: t('aiTradersToast.saved', language),
-        error: t('aiTradersToast.saveFailed', language),
-      })
+      await api.updateTrader(editingTrader.trader_id, request)
+      toast.success(t('aiTradersToast.saved', language))
       setShowEditModal(false)
       setEditingTrader(null)
       await mutateTraders()
@@ -289,11 +309,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
     }
 
     try {
-      await toast.promise(api.deleteTrader(traderId), {
-        loading: t('aiTradersToast.deleting', language),
-        success: t('aiTradersToast.deleted', language),
-        error: t('aiTradersToast.deleteFailed', language),
-      })
+      await api.deleteTrader(traderId)
+      toast.success(t('aiTradersToast.deleted', language))
 
       await mutateTraders()
     } catch (error) {
@@ -305,17 +322,11 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
   const handleToggleTrader = async (traderId: string, running: boolean) => {
     try {
       if (running) {
-        await toast.promise(api.stopTrader(traderId), {
-          loading: t('aiTradersToast.stopping', language),
-          success: t('aiTradersToast.stopped', language),
-          error: t('aiTradersToast.stopFailed', language),
-        })
+        await api.stopTrader(traderId)
+      toast.success(t('aiTradersToast.stopped', language))
       } else {
-        await toast.promise(api.startTrader(traderId), {
-          loading: t('aiTradersToast.starting', language),
-          success: t('aiTradersToast.started', language),
-          error: t('aiTradersToast.startFailed', language),
-        })
+        await api.startTrader(traderId)
+      toast.success(t('aiTradersToast.started', language))
       }
 
       await mutateTraders()
@@ -328,11 +339,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
   const handleToggleCompetition = async (traderId: string, currentShowInCompetition: boolean) => {
     try {
       const newValue = !currentShowInCompetition
-      await toast.promise(api.toggleCompetition(traderId, newValue), {
-        loading: t('aiTradersToast.updating', language),
-        success: newValue ? t('aiTradersToast.showInCompetition', language) : t('aiTradersToast.hideInCompetition', language),
-        error: t('aiTradersToast.updateFailed', language),
-      })
+      await api.toggleCompetition(traderId, newValue)
+      toast.success(newValue ? t('aiTradersToast.showInCompetition', language) : t('aiTradersToast.hideInCompetition', language))
 
       await mutateTraders()
     } catch (error) {
@@ -392,11 +400,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
         ) || []
 
       const request = config.buildRequest(updatedItems)
-      await toast.promise(config.updateApi(request), {
-        loading: t('aiTradersToast.updatingConfig', language),
-        success: t('aiTradersToast.configUpdated', language),
-        error: t('aiTradersToast.configUpdateFailed', language),
-      })
+      await config.updateApi(request)
+      toast.success(t('aiTradersToast.configUpdated', language))
 
       const refreshedItems = await config.refreshApi()
       config.setItems(refreshedItems)
@@ -505,11 +510,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
         ),
       }
 
-      await toast.promise(api.updateModelConfigs(request), {
-        loading: t('aiTradersToast.updatingModelConfig', language),
-        success: t('aiTradersToast.modelConfigUpdated', language),
-        error: t('aiTradersToast.modelConfigUpdateFailed', language),
-      })
+      await api.updateModelConfigs(request)
+      toast.success(t('aiTradersToast.modelConfigUpdated', language))
 
       const refreshedModels = await api.getModelConfigs()
       setAllModels(refreshedModels)
@@ -535,11 +537,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
     if (!ok) return
 
     try {
-      await toast.promise(api.deleteExchange(exchangeId), {
-        loading: t('aiTradersToast.deletingExchange', language),
-        success: t('aiTradersToast.exchangeDeleted', language),
-        error: t('aiTradersToast.exchangeDeleteFailed', language),
-      })
+      await api.deleteExchange(exchangeId)
+      toast.success(t('aiTradersToast.exchangeDeleted', language))
 
       const refreshedExchanges = await api.getExchangeConfigs()
       setAllExchanges(refreshedExchanges)
@@ -597,11 +596,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
           },
         }
 
-        await toast.promise(api.updateExchangeConfigsEncrypted(request), {
-          loading: t('aiTradersToast.updatingExchangeConfig', language),
-          success: t('aiTradersToast.exchangeConfigUpdated', language),
-          error: t('aiTradersToast.exchangeConfigUpdateFailed', language),
-        })
+        await api.updateExchangeConfigsEncrypted(request)
+      toast.success(t('aiTradersToast.exchangeConfigUpdated', language))
       } else {
         const createRequest = {
           exchange_type: exchangeType,
@@ -621,11 +617,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
           lighter_api_key_index: lighterApiKeyIndex || 0,
         }
 
-        await toast.promise(api.createExchangeEncrypted(createRequest), {
-          loading: t('aiTradersToast.creatingExchange', language),
-          success: t('aiTradersToast.exchangeCreated', language),
-          error: t('aiTradersToast.exchangeCreateFailed', language),
-        })
+        await api.createExchangeEncrypted(createRequest)
+      toast.success(t('aiTradersToast.exchangeCreated', language))
       }
 
       const refreshedExchanges = await api.getExchangeConfigs()
@@ -648,6 +641,36 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
     setEditingExchange(null)
     setShowExchangeModal(true)
   }
+
+  const handleQuickSetupClaw402 = async () => {
+    if (quickSetupLoading) return
+
+    try {
+      setQuickSetupLoading(true)
+      const result = await api.prepareBeginnerOnboarding()
+      setBeginnerWalletAddress(result.address)
+      const refreshedModels = await api.getModelConfigs()
+      setAllModels(refreshedModels)
+      toast.success(
+        language === 'zh'
+          ? 'Claw402 已默认配置为 DeepSeek'
+          : 'Claw402 is configured with DeepSeek by default'
+      )
+    } catch (error) {
+      console.error('Failed to quick setup claw402:', error)
+      toast.error(
+        language === 'zh'
+          ? '一键配置 Claw402 失败'
+          : 'Failed to quick setup Claw402'
+      )
+    } finally {
+      setQuickSetupLoading(false)
+    }
+  }
+
+  const claw402Configured = configuredModels.some((model) => model.provider === 'claw402')
+  const hasStrategies = (strategies?.length || 0) > 0
+  const canCreateTrader = configuredModels.length > 0 && configuredExchanges.length > 0
 
   return (
     <DeepVoidBackground className="py-8" disableAnimation>
@@ -720,6 +743,21 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
           </div>
         </div>
 
+        {isBeginnerMode ? (
+          <BeginnerGuideCards
+            language={language}
+            claw402Ready={claw402Configured}
+            exchangeReady={configuredExchanges.length > 0}
+            strategyReady={hasStrategies}
+            canCreateTrader={canCreateTrader}
+            walletAddress={beginnerWalletAddress}
+            onQuickSetupClaw402={handleQuickSetupClaw402}
+            onOpenExchange={handleAddExchange}
+            onOpenStrategy={() => navigateInApp('/strategy')}
+            onCreateTrader={() => setShowCreateModal(true)}
+          />
+        ) : null}
+
         {/* Configuration Status Grid */}
         <ConfigStatusGrid
           configuredModels={configuredModels}
@@ -748,7 +786,7 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
           copiedId={copiedId}
           language={language}
           onTraderSelect={onTraderSelect}
-          onNavigate={(path) => navigate(path)}
+          onNavigate={navigateInApp}
           onEditTrader={handleEditTrader}
           onToggleTrader={handleToggleTrader}
           onToggleCompetition={handleToggleCompetition}
