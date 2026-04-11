@@ -54,7 +54,7 @@ func (s *Server) handleBeginnerOnboarding(c *gin.Context) {
 	}
 
 	if !reusedExisting {
-		if err := s.store.AIModel().Update(userID, "claw402", true, privateKey, "", "deepseek"); err != nil {
+		if err := s.store.AIModel().Update(userID, "claw402", true, privateKey, "", "glm-5"); err != nil {
 			logger.Errorf("Failed to save beginner claw402 config for user %s: %v", userID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save beginner model configuration"})
 			return
@@ -68,7 +68,7 @@ func (s *Server) handleBeginnerOnboarding(c *gin.Context) {
 
 	os.Setenv("CLAW402_WALLET_KEY", privateKey)
 	os.Setenv("CLAW402_WALLET_ADDRESS", address)
-	os.Setenv("CLAW402_DEFAULT_MODEL", "deepseek")
+	os.Setenv("CLAW402_DEFAULT_MODEL", "glm-5")
 
 	envSaved, envPath, envErr := persistBeginnerWalletEnv(privateKey, address)
 	resp := beginnerOnboardingResponse{
@@ -77,7 +77,7 @@ func (s *Server) handleBeginnerOnboarding(c *gin.Context) {
 		Chain:             "base",
 		Asset:             "USDC",
 		Provider:          "claw402",
-		DefaultModel:      "deepseek",
+		DefaultModel:      "glm-5",
 		ConfiguredModelID: configuredModelID,
 		BalanceUSDC:       wallet.QueryUSDCBalanceStr(address),
 		EnvSaved:          envSaved,
@@ -152,6 +152,7 @@ func (s *Server) handleCurrentBeginnerWallet(c *gin.Context) {
 }
 
 func (s *Server) resolveBeginnerWallet(userID string) (privateKey string, address string, configuredModelID string, reused bool, err error) {
+	// 1. Check if current user already has a claw402 wallet
 	models, err := s.store.AIModel().List(userID)
 	if err != nil {
 		return "", "", "", false, err
@@ -175,6 +176,25 @@ func (s *Server) resolveBeginnerWallet(userID string) (privateKey string, addres
 		return existingKey, addr, model.ID, true, nil
 	}
 
+	// 2. Check for orphan claw402 wallet from a previous account (e.g. after account reset).
+	//    Adopt it to preserve funds.
+	orphan, orphanErr := s.store.AIModel().FindOrphanClaw402()
+	if orphanErr == nil && orphan != nil {
+		existingKey := strings.TrimSpace(orphan.APIKey.String())
+		if existingKey != "" {
+			addr, addrErr := walletAddressFromPrivateKey(existingKey)
+			if addrErr == nil {
+				if adoptErr := s.store.AIModel().AdoptModel(orphan.ID, userID); adoptErr != nil {
+					logger.Warnf("Failed to adopt orphan claw402 wallet for user %s: %v", userID, adoptErr)
+				} else {
+					logger.Infof("✓ Adopted orphan claw402 wallet %s for new user %s (address: %s)", orphan.ID, userID, addr)
+					return existingKey, addr, orphan.ID, true, nil
+				}
+			}
+		}
+	}
+
+	// 3. No existing wallet found — generate a new one
 	privateKeyObj, genErr := gethcrypto.GenerateKey()
 	if genErr != nil {
 		return "", "", "", false, genErr
@@ -233,7 +253,7 @@ func persistBeginnerWalletEnv(privateKey string, address string) (bool, string, 
 		if err := upsertEnvFile(path, map[string]string{
 			"CLAW402_WALLET_KEY":     privateKey,
 			"CLAW402_WALLET_ADDRESS": address,
-			"CLAW402_DEFAULT_MODEL":  "deepseek",
+			"CLAW402_DEFAULT_MODEL":  "glm-5",
 		}); err != nil {
 			lastErr = err
 			continue
