@@ -60,7 +60,7 @@ func (s *Server) handleRegister(c *gin.Context) {
 
 	var req struct {
 		Email    string `json:"email" binding:"required,email"`
-		Password string `json:"password" binding:"required,min=6"`
+		Password string `json:"password" binding:"required,min=8"`
 		Lang     string `json:"lang"`
 	}
 
@@ -102,9 +102,11 @@ func (s *Server) handleRegister(c *gin.Context) {
 		return
 	}
 
-	// Adopt orphan records from previous account (e.g. after account reset)
-	// This preserves wallet keys and exchange configs so funds are not lost.
-	s.adoptOrphanRecords(userID)
+	// NOTE: Orphan record adoption was removed for security reasons. Previously,
+	// after a reset-account call, any new user would inherit the prior owner's
+	// wallet keys and exchange API credentials — a catastrophic IDOR/takeover
+	// path. Operators who need to migrate credentials across users must do so
+	// explicitly via export/import, never via implicit adoption on registration.
 
 	// Generate JWT token
 	token, err := auth.GenerateJWT(user.ID, user.Email)
@@ -127,6 +129,13 @@ func (s *Server) handleRegister(c *gin.Context) {
 	})
 }
 
+// dummyPasswordHash is a valid bcrypt hash of a throwaway value. It is compared
+// against when the submitted email does not exist so that login takes roughly
+// the same time whether or not the account exists — closing the timing side
+// channel that would otherwise let an attacker enumerate valid emails (a fast
+// "no such user" vs. a slow bcrypt compare). It is not a secret.
+const dummyPasswordHash = "$2a$10$0iF0bCoQLJ6Ph1bF.MXwHOW.IMTxQjeEW.w38dctRQAB2kwB6ga1q"
+
 // handleLogin Handle user login request
 func (s *Server) handleLogin(c *gin.Context) {
 	var req struct {
@@ -142,6 +151,9 @@ func (s *Server) handleLogin(c *gin.Context) {
 	// Get user information
 	user, err := s.store.User().GetByEmail(req.Email)
 	if err != nil {
+		// Perform a dummy comparison so the response time does not reveal
+		// whether the email exists (anti user-enumeration), then fail uniformly.
+		auth.CheckPassword(req.Password, dummyPasswordHash)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Email or password incorrect"})
 		return
 	}
@@ -189,86 +201,14 @@ func (s *Server) handleChangePassword(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Password updated"})
 }
 
-// handleResetPassword Reset password via email and new password
-func (s *Server) handleResetPassword(c *gin.Context) {
-	var req struct {
-		Email       string `json:"email" binding:"required,email"`
-		NewPassword string `json:"new_password" binding:"required,min=6"`
-	}
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		SafeBadRequest(c, "Invalid request parameters")
-		return
-	}
-
-	// Query user
-	user, err := s.store.User().GetByEmail(req.Email)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Email does not exist"})
-		return
-	}
-
-	// Generate new password hash
-	newPasswordHash, err := auth.HashPassword(req.NewPassword)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Password processing failed"})
-		return
-	}
-
-	// Update password
-	err = s.store.User().UpdatePassword(user.ID, newPasswordHash)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Password update failed"})
-		return
-	}
-
-	logger.Infof("✓ User %s password has been reset", user.Email)
-	c.JSON(http.StatusOK, gin.H{"message": "Password reset successful, please login with new password"})
-}
-
-// handleResetAccount clears user authentication data so the system returns to
-// uninitialized state for re-registration. Wallet keys (ai_models) are preserved
-// so funds are not lost — they will be adopted by the new account during onboarding.
-func (s *Server) handleResetAccount(c *gin.Context) {
-	err := s.store.Transaction(func(tx *gorm.DB) error {
-		// Delete traders and strategies (config, not funds)
-		tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&store.Trader{})
-		tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&store.Strategy{})
-		// Delete users — ai_models and exchanges are intentionally kept
-		// so wallet private keys and exchange configs survive re-registration
-		if err := tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&store.User{}).Error; err != nil {
-			return fmt.Errorf("failed to delete users: %w", err)
-		}
-		return nil
-	})
-	if err != nil {
-		SafeInternalError(c, "Failed to reset account", err)
-		return
-	}
-
-	logger.Infof("✓ User accounts cleared (wallets preserved) — system reset to uninitialized")
-	c.JSON(http.StatusOK, gin.H{"message": "Account reset successful, you can now register a new account"})
-}
-
-// adoptOrphanRecords re-assigns ai_models and exchanges whose user_id no longer
-// exists in the users table. This happens after account reset so the new user
-// inherits the previous wallet keys and exchange configurations.
-func (s *Server) adoptOrphanRecords(newUserID string) {
-	db := s.store.GormDB()
-	result := db.Model(&store.AIModel{}).
-		Where("user_id NOT IN (SELECT id FROM users)").
-		Update("user_id", newUserID)
-	if result.RowsAffected > 0 {
-		logger.Infof("✓ Adopted %d orphan ai_model(s) for new user %s", result.RowsAffected, newUserID)
-	}
-
-	result = db.Model(&store.Exchange{}).
-		Where("user_id NOT IN (SELECT id FROM users)").
-		Update("user_id", newUserID)
-	if result.RowsAffected > 0 {
-		logger.Infof("✓ Adopted %d orphan exchange(s) for new user %s", result.RowsAffected, newUserID)
-	}
-}
+// NOTE: Password and account recovery used to live here as the public,
+// unauthenticated handlers handleResetPassword / handleResetAccount. They were
+// removed because an unauthenticated recovery endpoint is a remotely
+// exploitable auth-bypass on any public-facing deployment: the confirm phrase
+// was embedded in the frontend (and echoed back by the API), so it was friction
+// rather than authentication. Recovery now lives in the local CLI
+// (`nofx reset-password` / `nofx reset-account`, see cli.go), which requires
+// shell access to the host — something a remote attacker does not have.
 
 // initUserDefaultConfigs Initialize default configs for new user
 func (s *Server) initUserDefaultConfigs(userID string, lang string) error {
@@ -285,23 +225,17 @@ func (s *Server) createDefaultStrategies(userID string, lang string) error {
 		name, description string
 	}
 	type strategyLocale struct {
-		balanced, conservative, aggressive strategyI18n
+		defaultStrategy strategyI18n
 	}
 	locales := map[string]strategyLocale{
 		"zh": {
-			balanced:     strategyI18n{"均衡策略", "系统默认策略。均衡风险收益，适合大多数市场环境。5倍杠杆，最多3个仓位。"},
-			conservative: strategyI18n{"稳健策略", "系统默认策略。低杠杆保守操作，优先保护本金。3倍杠杆，专注主流资产。"},
-			aggressive:   strategyI18n{"积极策略", "系统默认策略。高杠杆主动交易，更广泛的币种选择，适合经验丰富的交易者。10倍杠杆，最多5个仓位。"},
+			defaultStrategy: strategyI18n{"NOFX Claw402 Auto Strategy", "The only built-in strategy: read the Claw402.ai direction board each cycle, load direction history and cost/liquidation heatmaps, then manage positions by the live board."},
 		},
 		"en": {
-			balanced:     strategyI18n{"Balanced Strategy", "System default strategy. Balanced risk-reward, suitable for most market conditions. 5x leverage, up to 3 positions."},
-			conservative: strategyI18n{"Conservative Strategy", "System default strategy. Low-leverage conservative trading, capital preservation first. 3x leverage, focused on major assets."},
-			aggressive:   strategyI18n{"Aggressive Strategy", "System default strategy. High-leverage active trading, wider asset selection, for experienced traders. 10x leverage, up to 5 positions."},
+			defaultStrategy: strategyI18n{"NOFX Claw402 Auto Strategy", "The only built-in strategy: read the Claw402.ai direction board each cycle, load direction history and cost/liquidation heatmaps, then manage positions by the live board."},
 		},
 		"id": {
-			balanced:     strategyI18n{"Strategi Seimbang", "Strategi default sistem. Risiko-reward seimbang, cocok untuk sebagian besar kondisi pasar. Leverage 5x, hingga 3 posisi."},
-			conservative: strategyI18n{"Strategi Konservatif", "Strategi default sistem. Trading konservatif leverage rendah, utamakan perlindungan modal. Leverage 3x, fokus aset utama."},
-			aggressive:   strategyI18n{"Strategi Agresif", "Strategi default sistem. Trading aktif leverage tinggi, pilihan aset lebih luas, untuk trader berpengalaman. Leverage 10x, hingga 5 posisi."},
+			defaultStrategy: strategyI18n{"Strategi Otomatis NOFX Claw402", "Satu strategi bawaan: membaca papan arah Claw402.ai setiap siklus, memuat riwayat arah dan heatmap biaya/likuidasi, lalu mengelola posisi mengikuti papan langsung."},
 		},
 	}
 	locale, ok := locales[lang]
@@ -316,45 +250,44 @@ func (s *Server) createDefaultStrategies(userID string, lang string) error {
 		applyConfig func(*store.StrategyConfig)
 	}
 
+	setClaw402Strategy := func(c *store.StrategyConfig) {
+		c.CoinSource.SourceType = "vergex_signal"
+		c.CoinSource.StaticCoins = nil
+		c.CoinSource.UseAI500 = false
+		c.CoinSource.UseOITop = false
+		c.CoinSource.UseOILow = false
+		c.CoinSource.UseHyperAll = false
+		c.CoinSource.UseHyperMain = false
+		c.CoinSource.HyperRankCategory = "all"
+		c.CoinSource.VergexLimit = 10
+		c.CoinSource.VergexMarketType = "all"
+		c.CoinSource.VergexChain = "hyperliquid"
+		c.RiskControl.MaxPositions = store.AutopilotDefaultMaxPositions
+		c.RiskControl.BTCETHMaxLeverage = 10
+		c.RiskControl.AltcoinMaxLeverage = 10
+		// Position-value ratios are hard per-position caps. Actual Autopilot
+		// allocation is calculated separately from leverage and slot count.
+		c.RiskControl.BTCETHMaxPositionValueRatio = store.AutopilotMaxPositionValueRatio
+		c.RiskControl.AltcoinMaxPositionValueRatio = store.AutopilotMaxPositionValueRatio
+		c.RiskControl.MaxMarginUsage = 1.0
+		c.RiskControl.MinConfidence = 78
+		c.RiskControl.MinRiskRewardRatio = 3.0
+		c.Indicators.Klines.PrimaryTimeframe = "15m"
+		c.Indicators.Klines.PrimaryCount = 30
+		c.Indicators.Klines.LongerTimeframe = ""
+		c.Indicators.Klines.LongerCount = 0
+		c.Indicators.Klines.EnableMultiTimeframe = false
+		c.Indicators.Klines.SelectedTimeframes = []string{"15m"}
+		c.Indicators.EnableRawKlines = true
+	}
+
 	definitions := []strategyDef{
 		{
-			name:        locale.balanced.name,
-			description: locale.balanced.description,
+			name:        locale.defaultStrategy.name,
+			description: locale.defaultStrategy.description,
 			isActive:    true,
 			applyConfig: func(c *store.StrategyConfig) {
-				// Uses default config as-is
-			},
-		},
-		{
-			name:        locale.conservative.name,
-			description: locale.conservative.description,
-			isActive:    false,
-			applyConfig: func(c *store.StrategyConfig) {
-				c.RiskControl.BTCETHMaxLeverage = 3
-				c.RiskControl.AltcoinMaxLeverage = 3
-				c.RiskControl.BTCETHMaxPositionValueRatio = 3.0
-				c.RiskControl.AltcoinMaxPositionValueRatio = 0.5
-				c.RiskControl.MinConfidence = 80
-				c.RiskControl.MinRiskRewardRatio = 4.0
-				c.Indicators.Klines.SelectedTimeframes = []string{"15m", "1h", "4h"}
-				c.Indicators.Klines.PrimaryTimeframe = "15m"
-			},
-		},
-		{
-			name:        locale.aggressive.name,
-			description: locale.aggressive.description,
-			isActive:    false,
-			applyConfig: func(c *store.StrategyConfig) {
-				c.RiskControl.BTCETHMaxLeverage = 10
-				c.RiskControl.AltcoinMaxLeverage = 7
-				c.RiskControl.MaxPositions = 5
-				c.RiskControl.AltcoinMaxPositionValueRatio = 2.0
-				c.RiskControl.MinConfidence = 70
-				c.CoinSource.AI500Limit = 5
-				c.CoinSource.UseOITop = true
-				c.CoinSource.OITopLimit = 5
-				c.Indicators.Klines.SelectedTimeframes = []string{"3m", "15m", "1h"}
-				c.Indicators.Klines.PrimaryTimeframe = "3m"
+				setClaw402Strategy(c)
 			},
 		},
 	}
@@ -370,6 +303,7 @@ func (s *Server) createDefaultStrategies(userID string, lang string) error {
 	for _, def := range definitions {
 		config := store.GetDefaultStrategyConfig(configLang)
 		def.applyConfig(&config)
+		config.ClampLimits()
 
 		strategy := &store.Strategy{
 			ID:          uuid.New().String(),
@@ -385,10 +319,65 @@ func (s *Server) createDefaultStrategies(userID string, lang string) error {
 		strategies = append(strategies, strategy)
 	}
 
+	legacyDefaultNames := []string{
+		"Balanced Strategy", "Steady Strategy", "Aggressive Strategy",
+		"US Stock Trend Strategy", "US Stock Steady Strategy", "US Stock Breakout Strategy",
+		"Balanced Strategy", "Conservative Strategy", "Aggressive Strategy",
+		"US Stock Trend Strategy", "US Stock Steady Strategy", "US Stock Breakout Strategy",
+		"Strategi Seimbang", "Strategi Konservatif", "Strategi Agresif",
+		"Strategi Tren Saham AS", "Strategi Stabil Saham AS", "Strategi Breakout Saham AS",
+	}
+
 	return s.store.Transaction(func(tx *gorm.DB) error {
+		// Remove obsolete built-in risk-profile presets for this user. If a trader still
+		// references one of them, keep it to avoid breaking an existing running setup.
+		deleteResult := tx.Where("user_id = ? AND name IN ? AND id NOT IN (SELECT strategy_id FROM traders WHERE user_id = ? AND strategy_id IS NOT NULL)", userID, legacyDefaultNames, userID).
+			Delete(&store.Strategy{})
+		if deleteResult.Error != nil {
+			return fmt.Errorf("failed to remove legacy default strategies: %w", deleteResult.Error)
+		}
+		if deleteResult.RowsAffected > 0 {
+			logger.Infof("  ✓ Removed %d legacy default strategy preset(s)", deleteResult.RowsAffected)
+		}
+
+		var activeCount int64
+		if err := tx.Model(&store.Strategy{}).Where("user_id = ? AND is_active = ?", userID, true).Count(&activeCount).Error; err != nil {
+			return fmt.Errorf("failed to count active strategies: %w", err)
+		}
+
 		for _, strategy := range strategies {
+			var existing store.Strategy
+			query := tx.Where("user_id = ? AND name = ?", userID, strategy.Name).First(&existing)
+			if query.Error == nil {
+				config, err := existing.ParseConfig()
+				if err != nil {
+					return fmt.Errorf("failed to parse existing strategy %q: %w", strategy.Name, err)
+				}
+				if store.MigrateLegacyAutopilotRiskDefaults(config) {
+					config.ClampLimits()
+					if err := existing.SetConfig(config); err != nil {
+						return fmt.Errorf("failed to serialize migrated strategy %q: %w", strategy.Name, err)
+					}
+					if err := tx.Model(&store.Strategy{}).
+						Where("id = ? AND user_id = ?", existing.ID, userID).
+						Updates(map[string]interface{}{"config": existing.Config, "updated_at": time.Now().UTC()}).Error; err != nil {
+						return fmt.Errorf("failed to migrate strategy %q: %w", strategy.Name, err)
+					}
+					logger.Infof("  ✓ Migrated default strategy to eight-position Autopilot: %s", strategy.Name)
+				}
+				continue
+			}
+			if query.Error != gorm.ErrRecordNotFound {
+				return fmt.Errorf("failed to check strategy %q: %w", strategy.Name, query.Error)
+			}
+			if activeCount > 0 {
+				strategy.IsActive = false
+			}
 			if err := tx.Create(strategy).Error; err != nil {
 				return fmt.Errorf("failed to create strategy %q: %w", strategy.Name, err)
+			}
+			if strategy.IsActive {
+				activeCount++
 			}
 			logger.Infof("  ✓ Created default strategy: %s (active=%v)", strategy.Name, strategy.IsActive)
 		}

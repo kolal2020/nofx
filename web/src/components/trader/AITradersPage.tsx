@@ -1,28 +1,34 @@
 import { useState, useEffect } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import useSWR from 'swr'
 import { api } from '../../lib/api'
+import { ApiError } from '../../lib/httpClient'
+import { ROUTES } from '../../router/paths'
 import type {
   TraderInfo,
   CreateTraderRequest,
   AIModel,
   Exchange,
+  ExchangeAccountState,
 } from '../../types'
 import { useLanguage } from '../../contexts/LanguageContext'
 import { t } from '../../i18n/translations'
 import { useAuth } from '../../contexts/AuthContext'
 import { TraderConfigModal } from './TraderConfigModal'
-import { DeepVoidBackground } from '../common/DeepVoidBackground'
 import { ExchangeConfigModal } from './ExchangeConfigModal'
-import { TelegramConfigModal } from './TelegramConfigModal'
 import { ModelConfigModal } from './ModelConfigModal'
 import { ConfigStatusGrid } from './ConfigStatusGrid'
 import { TradersList } from './TradersList'
+import { AutopilotLaunchPanel } from './AutopilotLaunchPanel'
 import {
   Bot,
   Plus,
-  MessageCircle,
+  ArrowUpRight,
+  Cable,
+  RefreshCw,
+  Settings2,
 } from 'lucide-react'
+import './ConfigPage.css'
 import { confirmToast } from '../../lib/notify'
 import { toast } from 'sonner'
 
@@ -34,16 +40,41 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
   const { language } = useLanguage()
   const { user, token } = useAuth()
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [configsLoading, setConfigsLoading] = useState(true)
+  const [configError, setConfigError] = useState('')
+  const [showLaunch, setShowLaunch] = useState(
+    searchParams.get('setup') === 'hyperliquid-funds'
+  )
+  const configView =
+    searchParams.get('view') === 'autopilot' ||
+    searchParams.get('setup') === 'hyperliquid-funds'
+      ? 'autopilot'
+      : 'connections'
+  const changeConfigView = (view: string) => {
+    const next = new URLSearchParams(searchParams)
+    if (view === 'autopilot') next.set('view', view)
+    else next.delete('view')
+    setSearchParams(next, { replace: true })
+  }
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [showEditModal, setShowEditModal] = useState(false)
   const [showModelModal, setShowModelModal] = useState(false)
   const [showExchangeModal, setShowExchangeModal] = useState(false)
-  const [showTelegramModal, setShowTelegramModal] = useState(false)
   const [editingModel, setEditingModel] = useState<string | null>(null)
   const [editingExchange, setEditingExchange] = useState<string | null>(null)
+  const [initialModelId, setInitialModelId] = useState<string | null>(null)
+  const [initialExchangeType, setInitialExchangeType] = useState<string | null>(
+    null
+  )
   const [editingTrader, setEditingTrader] = useState<any>(null)
   const [allModels, setAllModels] = useState<AIModel[]>([])
   const [allExchanges, setAllExchanges] = useState<Exchange[]>([])
+  const [exchangeAccountStates, setExchangeAccountStates] = useState<
+    Record<string, ExchangeAccountState>
+  >({})
+  const [isExchangeAccountStatesLoading, setIsExchangeAccountStatesLoading] =
+    useState(false)
   const [supportedModels, setSupportedModels] = useState<AIModel[]>([])
   const [visibleTraderAddresses, setVisibleTraderAddresses] = useState<
     Set<string>
@@ -54,24 +85,37 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
   const [copiedId, setCopiedId] = useState<string | null>(null)
 
   const loadConfigs = async () => {
+    setConfigsLoading(true)
+    setConfigError('')
     if (!user || !token) {
       const models = await api.getSupportedModels()
       setSupportedModels(models)
+      setConfigsLoading(false)
       return
     }
 
-    const [
-      modelConfigs,
-      exchangeConfigs,
-      models,
-    ] = await Promise.all([
-      api.getModelConfigs(),
-      api.getExchangeConfigs(),
-      api.getSupportedModels(),
-    ])
-    setAllModels(modelConfigs)
-    setAllExchanges(exchangeConfigs)
-    setSupportedModels(models)
+    setIsExchangeAccountStatesLoading(true)
+    try {
+      const [modelConfigs, exchangeConfigs, models, accountStateResponse] =
+        await Promise.all([
+          api.getModelConfigs(),
+          api.getExchangeConfigs(),
+          api.getSupportedModels(),
+          api.getExchangeAccountState().catch(() => ({ states: {} })),
+        ])
+      setAllModels(modelConfigs)
+      setAllExchanges(exchangeConfigs)
+      setExchangeAccountStates(accountStateResponse.states || {})
+      setSupportedModels(models)
+    } catch (error) {
+      setConfigError(
+        'Connections could not be loaded. Saved credentials have not been changed.'
+      )
+      throw error
+    } finally {
+      setConfigsLoading(false)
+      setIsExchangeAccountStatesLoading(false)
+    }
   }
 
   // Toggle wallet address visibility for a trader
@@ -111,32 +155,25 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
     }
   }
 
-  const { data: traders, mutate: mutateTraders, isLoading: isTradersLoading } = useSWR<TraderInfo[]>(
-    user && token ? 'traders' : null,
-    api.getTraders,
-    { refreshInterval: 5000 }
-  )
+  const {
+    data: traders,
+    mutate: mutateTraders,
+    isLoading: isTradersLoading,
+  } = useSWR<TraderInfo[]>(user && token ? 'traders' : null, api.getTraders, {
+    refreshInterval: 5000,
+  })
 
   useEffect(() => {
-    loadConfigs()
-      .catch((error) => {
-        console.error('Failed to load configs:', error)
-      })
-  }, [user, token])
-
-  useEffect(() => {
-    const handleRefresh = () => {
-      loadConfigs().catch((error) => {
-        console.error('Failed to refresh configs:', error)
-      })
-    }
-    window.addEventListener('agent-config-refresh', handleRefresh)
-    return () => window.removeEventListener('agent-config-refresh', handleRefresh)
+    void loadConfigs().catch(() => {})
   }, [user, token])
 
   const configuredModels =
     allModels?.filter((m) => {
-      return m.enabled || (m.customApiUrl && m.customApiUrl.trim() !== '')
+      return (
+        m.enabled ||
+        m.has_api_key ||
+        (m.customApiUrl && m.customApiUrl.trim() !== '')
+      )
     }) || []
 
   const configuredExchanges =
@@ -147,7 +184,14 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
       if (e.id === 'hyperliquid') {
         return e.hyperliquidWalletAddr && e.hyperliquidWalletAddr.trim() !== ''
       }
-      return e.enabled
+      return (
+        e.enabled ||
+        e.has_api_key ||
+        e.has_hyperliquid_secret ||
+        e.has_aster_private_key ||
+        e.has_lighter_private_key ||
+        e.has_lighter_api_key_private_key
+      )
     }) || []
 
   const enabledModels = allModels?.filter((m) => m.enabled) || []
@@ -168,19 +212,11 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
       return true
     }) || []
 
-  const isModelInUse = (modelId: string) => {
-    return traders?.some((tr) => tr.ai_model === modelId && tr.is_running)
-  }
-
   const getModelUsageInfo = (modelId: string) => {
     const usingTraders = traders?.filter((tr) => tr.ai_model === modelId) || []
     const runningCount = usingTraders.filter((tr) => tr.is_running).length
     const totalCount = usingTraders.length
     return { runningCount, totalCount, usingTraders }
-  }
-
-  const isExchangeInUse = (exchangeId: string) => {
-    return traders?.some((tr) => tr.exchange_id === exchangeId && tr.is_running)
   }
 
   const getExchangeUsageInfo = (exchangeId: string) => {
@@ -265,7 +301,6 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
         ai_model_id: data.ai_model_id,
         exchange_id: data.exchange_id,
         strategy_id: data.strategy_id,
-        initial_balance: data.initial_balance,
         scan_interval_minutes: data.scan_interval_minutes,
         is_cross_margin: data.is_cross_margin,
         show_in_competition: data.show_in_competition,
@@ -311,7 +346,15 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
 
       await mutateTraders()
     } catch (error) {
-      console.error('Failed to toggle trader:', error)
+      // Launch preflight rejections carry an actionable reason (e.g. "AI fee
+      // wallet is empty") — show it instead of a generic failure toast.
+      if (
+        error instanceof ApiError &&
+        error.errorKey === 'trader.start.preflight_failed'
+      ) {
+        toast.error(error.message)
+        return
+      }
       toast.error(t('operationFailed', language))
     }
   }
@@ -337,17 +380,15 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
   }
 
   const handleModelClick = (modelId: string) => {
-    if (!isModelInUse(modelId)) {
-      setEditingModel(modelId)
-      setShowModelModal(true)
-    }
+    setInitialModelId(null)
+    setEditingModel(modelId)
+    setShowModelModal(true)
   }
 
   const handleExchangeClick = (exchangeId: string) => {
-    if (!isExchangeInUse(exchangeId)) {
-      setEditingExchange(exchangeId)
-      setShowExchangeModal(true)
-    }
+    setInitialExchangeType(null)
+    setEditingExchange(exchangeId)
+    setShowExchangeModal(true)
   }
 
   const handleDeleteConfig = async <T extends { id: string }>(config: {
@@ -572,6 +613,7 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
               passphrase: passphrase || '',
               testnet: testnet || false,
               hyperliquid_wallet_addr: hyperliquidWalletAddr || '',
+              hyperliquid_unified_account: exchangeType === 'hyperliquid',
               aster_user: asterUser || '',
               aster_signer: asterSigner || '',
               aster_private_key: asterPrivateKey || '',
@@ -595,6 +637,7 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
           passphrase: passphrase || '',
           testnet: testnet || false,
           hyperliquid_wallet_addr: hyperliquidWalletAddr || '',
+          hyperliquid_unified_account: exchangeType === 'hyperliquid',
           aster_user: asterUser || '',
           aster_signer: asterSigner || '',
           aster_private_key: asterPrivateKey || '',
@@ -620,193 +663,356 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
   }
 
   const handleAddModel = () => {
+    setInitialModelId(null)
     setEditingModel(null)
     setShowModelModal(true)
   }
 
   const handleAddExchange = () => {
+    setInitialExchangeType(null)
     setEditingExchange(null)
     setShowExchangeModal(true)
   }
 
+  const handleOpenClaw402Config = () => {
+    const configuredClaw402 = allModels?.find(
+      (model) => model.provider === 'claw402'
+    )
+    const supportedClaw402 = supportedModels?.find(
+      (model) => model.provider === 'claw402'
+    )
+    const modelId = configuredClaw402?.id || supportedClaw402?.id || 'claw402'
+
+    setEditingModel(configuredClaw402?.id || null)
+    setInitialModelId(modelId)
+    setShowModelModal(true)
+  }
+
+  const handleOpenHyperliquidConfig = () => {
+    const existingHyperliquid = allExchanges?.find(
+      (exchange) =>
+        exchange.exchange_type === 'hyperliquid' ||
+        exchange.id === 'hyperliquid'
+    )
+
+    setEditingExchange(existingHyperliquid?.id || null)
+    setInitialExchangeType(existingHyperliquid ? null : 'hyperliquid')
+    setShowExchangeModal(true)
+  }
+
+  useEffect(() => {
+    if (!user || !token) return
+
+    const setupTarget = searchParams.get('setup')
+    if (!setupTarget) return
+
+    if (setupTarget === 'claw402') {
+      // The welcome page shows the deposit QR, auto-creates the wallet if
+      // needed, and polls the balance — friendlier than the key-config modal.
+      navigate(ROUTES.welcome)
+    } else if (setupTarget === 'hyperliquid') {
+      handleOpenHyperliquidConfig()
+    } else if (setupTarget === 'hyperliquid-funds') {
+      setShowLaunch(true)
+      // Funding shortfall: bring the guided launch panel (with the trading
+      // balance step and live preflight polling) into view.
+      document
+        .getElementById('autopilot-launch-panel')
+        ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      toast.info(
+        'Deposit USDC to your Hyperliquid account, the balance check updates automatically.'
+      )
+    } else {
+      return
+    }
+
+    const nextParams = new URLSearchParams(searchParams)
+    if (setupTarget === 'hyperliquid-funds') nextParams.set('view', 'autopilot')
+    nextParams.delete('setup')
+    setSearchParams(nextParams, { replace: true })
+  }, [
+    allExchanges,
+    allModels,
+    searchParams,
+    setSearchParams,
+    supportedModels,
+    token,
+    user,
+  ])
+
+  const refreshLaunchState = async () => {
+    await Promise.all([loadConfigs(), mutateTraders()])
+  }
+
+  const hasRunningTrader = (traders || []).some((trader) => trader.is_running)
+  const launchPanel = (
+    <AutopilotLaunchPanel
+      models={allModels}
+      exchanges={allExchanges}
+      exchangeAccountStates={exchangeAccountStates}
+      traders={traders || []}
+      isLoggedIn={Boolean(user && token)}
+      language={language}
+      onRefresh={refreshLaunchState}
+      onOpenClaw402Config={handleOpenClaw402Config}
+      onOpenHyperliquidConfig={handleOpenHyperliquidConfig}
+    />
+  )
+
   return (
-    <DeepVoidBackground className="py-8" disableAnimation>
-      <div className="w-full px-4 md:px-8 space-y-8 animate-fade-in">
-        {/* Header - Terminal Style */}
-        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 border-b border-white/10 pb-6">
-          <div className="flex items-center gap-4">
-            <div className="relative group">
-              <div className="absolute -inset-1 bg-nofx-gold/20 rounded-xl blur opacity-0 group-hover:opacity-100 transition duration-500"></div>
-              <div className="w-12 h-12 md:w-14 md:h-14 rounded-xl flex items-center justify-center bg-black border border-nofx-gold/30 text-nofx-gold relative z-10 shadow-[0_0_15px_rgba(240,185,11,0.1)]">
-                <Bot className="w-6 h-6 md:w-7 md:h-7" />
-              </div>
-            </div>
+    <div className="config-page">
+      <header className="config-page-heading">
+        <div>
+          <span className="config-eyebrow">YOUR WORKSPACE</span>
+          <h1>Configuration</h1>
+          <p>Connect your AI. Link your accounts. Choose how you trade.</p>
+        </div>
+        <button
+          className="config-primary"
+          onClick={() => navigate(ROUTES.planning)}
+        >
+          Open Frontier <ArrowUpRight size={15} />
+        </button>
+      </header>
+      <div className="config-layout">
+        <aside className="config-sidebar">
+          <span className="config-nav-label">SETUP</span>
+          <button
+            aria-current={configView === 'connections' ? 'page' : undefined}
+            onClick={() => changeConfigView('connections')}
+          >
+            <Cable size={17} />
+            <span>
+              Connections<small>AI & trading accounts</small>
+            </span>
+          </button>
+          <button
+            aria-current={configView === 'autopilot' ? 'page' : undefined}
+            onClick={() => changeConfigView('autopilot')}
+          >
+            <Bot size={17} />
+            <span>
+              Autopilot<small>Optional automated trading</small>
+            </span>
+            <b>{traders?.length || 0}</b>
+          </button>
+          <span className="config-nav-label">PREFERENCES</span>
+          <button onClick={() => navigate(ROUTES.settings)}>
+            <Settings2 size={17} />
+            <span>
+              Account settings<small>Profile & security</small>
+            </span>
+          </button>
+          <div className="config-sidebar-note">
+            <strong>You’re in control.</strong>
+            <p>
+              Frontier requires approval for each trade. Autopilot runs only
+              when you start it.
+            </p>
+          </div>
+        </aside>
+        <div className="config-main">
+          <div className="config-content-heading">
             <div>
-              <h1 className="text-2xl md:text-3xl font-bold font-mono tracking-tight text-white flex items-center gap-3 uppercase">
-                {t('aiTraders', language)}
-                <span className="text-xs font-mono font-normal px-2 py-0.5 rounded bg-nofx-gold/10 text-nofx-gold border border-nofx-gold/20 tracking-wider">
-                  {traders?.length || 0} ACTIVE_NODES
-                </span>
-              </h1>
-              <p className="text-xs font-mono text-zinc-500 uppercase tracking-widest mt-1 ml-1 flex items-center gap-2">
-                <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
-                SYSTEM_READY
+              <h2>
+                {configView === 'connections'
+                  ? 'Your connections'
+                  : 'Autopilot'}
+              </h2>
+              <p>
+                {configView === 'connections'
+                  ? 'Manage the services you use across NOFX.'
+                  : 'Configure and manage your automated traders.'}
               </p>
             </div>
-          </div>
-
-          <div className="flex gap-2 w-full md:w-auto overflow-x-auto pb-1 md:pb-0 hide-scrollbar">
             <button
-              onClick={handleAddModel}
-              className="px-4 py-2 rounded text-xs font-mono uppercase tracking-wider transition-all border border-zinc-700 bg-black/20 text-zinc-400 hover:text-white hover:border-zinc-500 whitespace-nowrap backdrop-blur-sm"
+              className="config-refresh"
+              disabled={configsLoading}
+              onClick={() => {
+                void refreshLaunchState().catch(() => {})
+              }}
             >
-              <div className="flex items-center gap-2">
-                <Plus className="w-3 h-3" />
-                <span>MODELS_CONFIG</span>
-              </div>
-            </button>
-
-            <button
-              onClick={handleAddExchange}
-              className="px-4 py-2 rounded text-xs font-mono uppercase tracking-wider transition-all border border-zinc-700 bg-black/20 text-zinc-400 hover:text-white hover:border-zinc-500 whitespace-nowrap backdrop-blur-sm"
-            >
-              <div className="flex items-center gap-2">
-                <Plus className="w-3 h-3" />
-                <span>EXCHANGE_KEYS</span>
-              </div>
-            </button>
-
-            <button
-              onClick={() => setShowTelegramModal(true)}
-              className="px-4 py-2 rounded text-xs font-mono uppercase tracking-wider transition-all border border-sky-900/50 bg-black/20 text-sky-500 hover:text-sky-300 hover:border-sky-700 whitespace-nowrap backdrop-blur-sm"
-            >
-              <div className="flex items-center gap-2">
-                <MessageCircle className="w-3 h-3" />
-                <span>TELEGRAM_BOT</span>
-              </div>
-            </button>
-
-            <button
-              onClick={() => setShowCreateModal(true)}
-              disabled={
-                configuredModels.length === 0 ||
-                configuredExchanges.length === 0
-              }
-              className="group relative px-6 py-2 rounded text-xs font-bold font-mono uppercase tracking-wider transition-all disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap overflow-hidden bg-nofx-gold text-black hover:bg-yellow-400 shadow-[0_0_20px_rgba(240,185,11,0.2)] hover:shadow-[0_0_30px_rgba(240,185,11,0.4)]"
-            >
-              <span className="relative z-10 flex items-center gap-2">
-                <Plus className="w-4 h-4" />
-                {t('createTrader', language)}
-              </span>
-              <div className="absolute inset-0 bg-white/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>
+              <RefreshCw size={14} />{' '}
+              {configsLoading ? 'Refreshing…' : 'Refresh'}
             </button>
           </div>
+          {configError && (
+            <p className="config-load-error" role="alert">
+              {configError}
+            </p>
+          )}
+          {configView === 'connections' && (
+            <>
+              {/* Configuration Status Grid */}
+              {!configError && (
+                <ConfigStatusGrid
+                  configuredModels={configuredModels}
+                  loading={configsLoading}
+                  onAddModel={handleAddModel}
+                  onAddExchange={handleAddExchange}
+                  configuredExchanges={configuredExchanges}
+                  exchangeAccountStates={exchangeAccountStates}
+                  isExchangeAccountStatesLoading={
+                    isExchangeAccountStatesLoading
+                  }
+                  visibleExchangeAddresses={visibleExchangeAddresses}
+                  copiedId={copiedId}
+                  language={language}
+                  getModelUsageInfo={getModelUsageInfo}
+                  getExchangeUsageInfo={getExchangeUsageInfo}
+                  onModelClick={handleModelClick}
+                  onExchangeClick={handleExchangeClick}
+                  onToggleExchangeAddress={toggleExchangeAddressVisibility}
+                  onCopyAddress={handleCopyAddress}
+                />
+              )}
+
+              <section className="config-next">
+                <span className="config-eyebrow">WHAT’S NEXT?</span>
+                <h3>From connections to your first trade.</h3>
+                <div>
+                  <button onClick={() => navigate(ROUTES.planning)}>
+                    <span>
+                      <strong>Explore with Frontier</strong>
+                      <small>
+                        Build plans with AI. Review and approve each trade
+                        yourself.
+                      </small>
+                    </span>
+                    <ArrowUpRight size={18} />
+                  </button>
+                  <button onClick={() => changeConfigView('autopilot')}>
+                    <span>
+                      <strong>Set up Autopilot</strong>
+                      <small>
+                        Choose a strategy and explicitly start an automated
+                        trader.
+                      </small>
+                    </span>
+                    <ArrowUpRight size={18} />
+                  </button>
+                </div>
+              </section>
+            </>
+          )}
+          {configView === 'autopilot' && (
+            <>
+              <div className="config-autopilot-actions">
+                <div>
+                  <strong>
+                    {isTradersLoading
+                      ? 'Checking Autopilot status…'
+                      : hasRunningTrader
+                        ? 'Autopilot is running'
+                        : 'No Autopilot is running'}
+                  </strong>
+                  <p>
+                    {configsLoading
+                      ? 'Checking saved connections…'
+                      : `${configuredModels.length} AI connection${configuredModels.length === 1 ? '' : 's'} · ${configuredExchanges.length} trading account${configuredExchanges.length === 1 ? '' : 's'}`}
+                  </p>
+                </div>
+                <button onClick={() => setShowLaunch((v) => !v)}>
+                  {showLaunch ? 'Hide guided setup' : 'Guided setup'}
+                </button>
+                <button
+                  className="config-primary"
+                  onClick={() => setShowCreateModal(true)}
+                  disabled={
+                    configsLoading ||
+                    !configuredModels.length ||
+                    !configuredExchanges.length
+                  }
+                >
+                  <Plus size={14} /> Create Autopilot
+                </button>
+              </div>
+              {showLaunch && launchPanel}
+              {/* Traders List */}
+              <TradersList
+                traders={traders}
+                isLoading={isTradersLoading}
+                allExchanges={allExchanges}
+                configuredModelsCount={configuredModels.length}
+                configuredExchangesCount={configuredExchanges.length}
+                visibleTraderAddresses={visibleTraderAddresses}
+                copiedId={copiedId}
+                language={language}
+                onTraderSelect={onTraderSelect}
+                onNavigate={(path) => navigate(path)}
+                onEditTrader={handleEditTrader}
+                onToggleTrader={handleToggleTrader}
+                onToggleCompetition={handleToggleCompetition}
+                onDeleteTrader={handleDeleteTrader}
+                onToggleTraderAddress={toggleTraderAddressVisibility}
+                onCopyAddress={handleCopyAddress}
+              />
+            </>
+          )}
         </div>
-
-        {/* Configuration Status Grid */}
-        <ConfigStatusGrid
-          configuredModels={configuredModels}
-          configuredExchanges={configuredExchanges}
-          visibleExchangeAddresses={visibleExchangeAddresses}
-          copiedId={copiedId}
-          language={language}
-          isModelInUse={isModelInUse}
-          getModelUsageInfo={getModelUsageInfo}
-          isExchangeInUse={isExchangeInUse}
-          getExchangeUsageInfo={getExchangeUsageInfo}
-          onModelClick={handleModelClick}
-          onExchangeClick={handleExchangeClick}
-          onToggleExchangeAddress={toggleExchangeAddressVisibility}
-          onCopyAddress={handleCopyAddress}
-        />
-
-        {/* Traders List */}
-        <TradersList
-          traders={traders}
-          isLoading={isTradersLoading}
-          allExchanges={allExchanges}
-          configuredModelsCount={configuredModels.length}
-          configuredExchangesCount={configuredExchanges.length}
-          visibleTraderAddresses={visibleTraderAddresses}
-          copiedId={copiedId}
-          language={language}
-          onTraderSelect={onTraderSelect}
-          onNavigate={(path) => navigate(path)}
-          onEditTrader={handleEditTrader}
-          onToggleTrader={handleToggleTrader}
-          onToggleCompetition={handleToggleCompetition}
-          onDeleteTrader={handleDeleteTrader}
-          onToggleTraderAddress={toggleTraderAddressVisibility}
-          onCopyAddress={handleCopyAddress}
-        />
-
-        {/* Create Trader Modal */}
-        {showCreateModal && (
-          <TraderConfigModal
-            isOpen={showCreateModal}
-            isEditMode={false}
-            availableModels={enabledModels}
-            availableExchanges={enabledExchanges}
-            onSave={handleCreateTrader}
-            onClose={() => setShowCreateModal(false)}
-          />
-        )}
-
-        {/* Edit Trader Modal */}
-        {showEditModal && editingTrader && (
-          <TraderConfigModal
-            isOpen={showEditModal}
-            isEditMode={true}
-            traderData={editingTrader}
-            availableModels={enabledModels}
-            availableExchanges={enabledExchanges}
-            onSave={handleSaveEditTrader}
-            onClose={() => {
-              setShowEditModal(false)
-              setEditingTrader(null)
-            }}
-          />
-        )}
-
-        {/* Model Configuration Modal */}
-        {showModelModal && (
-          <ModelConfigModal
-            allModels={supportedModels}
-            configuredModels={allModels}
-            editingModelId={editingModel}
-            onSave={handleSaveModelConfig}
-            onDelete={handleDeleteModelConfig}
-            onClose={() => {
-              setShowModelModal(false)
-              setEditingModel(null)
-            }}
-            language={language}
-          />
-        )}
-
-        {/* Exchange Configuration Modal */}
-        {showExchangeModal && (
-          <ExchangeConfigModal
-            allExchanges={allExchanges}
-            editingExchangeId={editingExchange}
-            onSave={handleSaveExchangeConfig}
-            onDelete={handleDeleteExchangeConfig}
-            onClose={() => {
-              setShowExchangeModal(false)
-              setEditingExchange(null)
-            }}
-            language={language}
-          />
-        )}
-
-        {/* Telegram Bot Modal */}
-        {showTelegramModal && (
-          <TelegramConfigModal
-            onClose={() => setShowTelegramModal(false)}
-            language={language}
-          />
-        )}
       </div>
-    </DeepVoidBackground>
+      {/* Create Trader Modal */}
+      {showCreateModal && (
+        <TraderConfigModal
+          isOpen={showCreateModal}
+          isEditMode={false}
+          availableModels={enabledModels}
+          availableExchanges={enabledExchanges}
+          onSave={handleCreateTrader}
+          onClose={() => setShowCreateModal(false)}
+        />
+      )}
+
+      {/* Edit Trader Modal */}
+      {showEditModal && editingTrader && (
+        <TraderConfigModal
+          isOpen={showEditModal}
+          isEditMode={true}
+          traderData={editingTrader}
+          availableModels={enabledModels}
+          availableExchanges={enabledExchanges}
+          onSave={handleSaveEditTrader}
+          onClose={() => {
+            setShowEditModal(false)
+            setEditingTrader(null)
+          }}
+        />
+      )}
+
+      {/* Model Configuration Modal */}
+      {showModelModal && (
+        <ModelConfigModal
+          allModels={supportedModels}
+          configuredModels={allModels}
+          editingModelId={editingModel}
+          initialModelId={initialModelId}
+          onSave={handleSaveModelConfig}
+          onDelete={handleDeleteModelConfig}
+          onClose={() => {
+            setShowModelModal(false)
+            setEditingModel(null)
+            setInitialModelId(null)
+          }}
+          language={language}
+        />
+      )}
+
+      {/* Exchange Configuration Modal */}
+      {showExchangeModal && (
+        <ExchangeConfigModal
+          allExchanges={allExchanges}
+          editingExchangeId={editingExchange}
+          initialExchangeType={initialExchangeType}
+          onSave={handleSaveExchangeConfig}
+          onDelete={handleDeleteExchangeConfig}
+          onClose={() => {
+            setShowExchangeModal(false)
+            setEditingExchange(null)
+            setInitialExchangeType(null)
+          }}
+          language={language}
+        />
+      )}
+    </div>
   )
 }

@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"fmt"
+	"math"
 	"nofx/logger"
+	hlprovider "nofx/provider/hyperliquid"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,10 +25,13 @@ type HyperliquidTrader struct {
 	isCrossMargin    bool              // Whether to use cross margin mode
 	isUnifiedAccount bool              // Whether to use Unified Account mode (Spot as collateral for Perps)
 	// xyz dex support (stocks, forex, commodities)
-	xyzMeta      *xyzDexMeta
-	xyzMetaMutex sync.RWMutex
-	privateKey   *ecdsa.PrivateKey // For xyz dex signing
-	isTestnet    bool
+	xyzMeta       *xyzDexMeta
+	xyzMetaMutex  sync.RWMutex
+	privateKey    *ecdsa.PrivateKey // For xyz dex signing
+	isTestnet     bool
+	apiURL        string // Set by constructor; overridden by local HTTP tests only.
+	xyzExchange   *hyperliquid.Exchange
+	xyzExchangeMu sync.Mutex
 }
 
 // xyzDexMeta represents metadata for xyz dex assets
@@ -58,54 +63,29 @@ var xyzDexAssets = map[string]bool{
 	"XYZ100": true,
 }
 
-// defaultBuilder is the builder info for order routing
-// Set to nil to avoid requiring builder fee approval
+// defaultBuilder is the builder info for order routing.
+// Users approve this builder during the top-right Hyperliquid connect flow before
+// their generated agent wallet is saved for live trading.
 //
-//	var defaultBuilder = &hyperliquid.BuilderInfo{
-//		Builder: "0x891dc6f05ad47a3c1a05da55e7a7517971faaf0d",
-//		Fee:     10,
-//	}
-var defaultBuilder *hyperliquid.BuilderInfo = nil
-
-// isXyzDexAsset checks if a symbol is an xyz dex asset
-func isXyzDexAsset(symbol string) bool {
-	// Remove common suffixes to get base symbol
-	base := strings.ToUpper(symbol) // Convert to uppercase for case-insensitive matching
-	for _, suffix := range []string{"USDT", "USD", "-USDC", "-USD"} {
-		if strings.HasSuffix(base, suffix) {
-			base = strings.TrimSuffix(base, suffix)
-			break
-		}
-	}
-	// Remove xyz: prefix if present (case-insensitive)
-	base = strings.TrimPrefix(base, "XYZ:")
-	base = strings.TrimPrefix(base, "xyz:")
-	return xyzDexAssets[base]
+// Fee is in tenths of a basis point: 50 = 5 bps = 0.05% (5 per 10,000). Existing
+// approvals at the prior 0.1% cap remain valid on-chain because 0.05% is
+// still within their approved max.
+var defaultBuilder = &hyperliquid.BuilderInfo{
+	Builder: "0x891dc6f05ad47a3c1a05da55e7a7517971faaf0d",
+	Fee:     50,
 }
 
-// convertSymbolToHyperliquid converts standard symbol to Hyperliquid format
-// Example: "BTCUSDT" -> "BTC", "TSLA" -> "xyz:TSLA", "silver" -> "xyz:SILVER"
+// isXyzDexAsset checks if a symbol is an xyz dex asset.
+// Keep this delegated to the provider map so newly listed xyz markets such as
+// SAMSUNG-USDC / SK-HYNIX-USDC cannot accidentally fall through as crypto.
+func isXyzDexAsset(symbol string) bool {
+	return hlprovider.IsXYZAsset(symbol)
+}
+
+// convertSymbolToHyperliquid converts standard/display symbols to Hyperliquid format.
+// Examples: "BTCUSDT" -> "BTC", "TSLA" -> "xyz:TSLA", "SAMSUNG-USDC" -> "xyz:SMSN".
 func convertSymbolToHyperliquid(symbol string) string {
-	// Convert to uppercase for consistent handling
-	base := strings.ToUpper(symbol)
-
-	// Remove common suffixes to get base symbol
-	for _, suffix := range []string{"USDT", "USD", "-USDC", "-USD"} {
-		if strings.HasSuffix(base, suffix) {
-			base = strings.TrimSuffix(base, suffix)
-			break
-		}
-	}
-	// Remove xyz: prefix if present (case-insensitive, will be re-added if needed)
-	if strings.HasPrefix(strings.ToLower(base), "xyz:") {
-		base = base[4:] // Remove first 4 characters
-	}
-
-	// Check if this is an xyz dex asset (stocks, forex, commodities)
-	if isXyzDexAsset(base) {
-		return "xyz:" + base
-	}
-	return base
+	return hlprovider.FormatCoinForAPI(symbol)
 }
 
 // absFloat returns absolute value of float
@@ -161,16 +141,30 @@ func NewHyperliquidTrader(privateKeyHex string, walletAddr string, testnet bool,
 
 	ctx := context.Background()
 
-	// Create Exchange client (Exchange includes Info functionality)
-	exchange := hyperliquid.NewExchange(
-		ctx,
-		privateKey,
-		apiURL,
-		nil,        // Meta will be fetched automatically
-		"",         // vault address (empty for personal account)
-		walletAddr, // wallet address
-		nil,        // SpotMeta will be fetched automatically
-	)
+	// Create Exchange client (Exchange includes Info functionality).
+	// v0.36 signature: ctx, privateKey, baseURL, meta, vaultAddr, accountAddr,
+	// spotMeta, perpDexs, ...opts. nil values are auto-fetched on first use.
+	// v0.36 fixed the spot-meta indexing panic that crashed earlier versions
+	// when Hyperliquid added new spot tokens whose Tokens[0] index pointed
+	// past the Tokens array end.
+	// The constructor still panics if any auto-fetch fails, so it runs inside
+	// initExchangeClient which converts the panic into a returned error.
+	exchange, err := initExchangeClient(func() *hyperliquid.Exchange {
+		return hyperliquid.NewExchange(
+			ctx,
+			privateKey,
+			apiURL,
+			nil,        // Meta — fetched automatically
+			"",         // vault address (empty for personal account)
+			walletAddr, // wallet address
+			nil,        // SpotMeta — fetched automatically
+			nil,        // perpDexs — fetched automatically
+			hyperliquid.ExchangeOptClientOptions(hyperliquid.ClientOptHTTPClient(checkedActionHTTPClient())),
+		)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("Hyperliquid API is temporarily unavailable, please retry: %w", err)
+	}
 
 	logger.Infof("✓ Hyperliquid trader initialized successfully (testnet=%v, wallet=%s)", testnet, walletAddr)
 
@@ -226,6 +220,7 @@ func NewHyperliquidTrader(privateKeyHex string, walletAddr string, testnet bool,
 		isUnifiedAccount: unifiedAccount, // Unified Account: Spot as Perp collateral
 		privateKey:       privateKey,
 		isTestnet:        testnet,
+		apiURL:           apiURL,
 	}, nil
 }
 
@@ -273,6 +268,56 @@ func (t *HyperliquidTrader) roundToSzDecimals(coin string, quantity float64) flo
 
 	// Round
 	return float64(int(quantity*multiplier+0.5)) / multiplier
+}
+
+// roundOrderPrice applies both Hyperliquid perp constraints: up to five
+// significant digits AND at most 6-szDecimals fractional digits. Integers are
+// always permitted. Unknown metadata and prices that round to zero fail closed.
+func (t *HyperliquidTrader) roundOrderPrice(coin string, price float64) (float64, error) {
+	decimals := -1
+	if strings.HasPrefix(coin, "xyz:") {
+		if _, err := t.leverageExchange(coin); err != nil {
+			return 0, err
+		}
+		t.xyzMetaMutex.RLock()
+		if t.xyzMeta != nil {
+			for _, asset := range t.xyzMeta.Universe {
+				if asset.Name == coin {
+					decimals = asset.SzDecimals
+					break
+				}
+			}
+		}
+		t.xyzMetaMutex.RUnlock()
+	} else {
+		t.metaMutex.RLock()
+		if t.meta != nil {
+			for _, asset := range t.meta.Universe {
+				if asset.Name == coin {
+					decimals = asset.SzDecimals
+					break
+				}
+			}
+		}
+		t.metaMutex.RUnlock()
+	}
+	if decimals < 0 || decimals > 6 {
+		return 0, fmt.Errorf("price precision unavailable for %s", coin)
+	}
+	return roundPerpPrice(price, decimals)
+}
+
+func roundPerpPrice(price float64, szDecimals int) (float64, error) {
+	if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) || szDecimals < 0 || szDecimals > 6 {
+		return 0, fmt.Errorf("invalid perp price or precision")
+	}
+	decimals := min(6-szDecimals, max(0, 4-int(math.Floor(math.Log10(price)))))
+	factor := math.Pow10(decimals)
+	rounded := math.Round(price*factor) / factor
+	if rounded <= 0 {
+		return 0, fmt.Errorf("price is below the market tick size")
+	}
+	return rounded, nil
 }
 
 // roundPriceToSigfigs rounds price to 5 significant figures

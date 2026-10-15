@@ -44,13 +44,18 @@ decision_logs/
 nofx_test
 
 # Node.js
+web/node_modules
 web/node_modules/
 node_modules/
 web/dist/
 web/.vite/
+*.tsbuildinfo
 
 # ESLint 临时报告文件（调试时生成，不纳入版本控制）
 eslint-*.json
+
+# 本地 Agent QA seed（个人调试用，不纳入版本控制）
+docs/qa/fixtures/agent_self_play_seed.zh-CN.json
 
 # VS code
 .vscode
@@ -129,3 +134,12 @@ PR_DESCRIPTION.md
 
 # Go build artifacts
 /nofx-server
+.gstack/
+
+# Local AI agent / skill scaffolding (not part of the runtime app)
+.agents/
+skills-lock.json
+img.png
+
+# Generated from the pinned charting submodule by web prebuild/predev.
+web/public/charting_library/

@@ -3,11 +3,11 @@ package trader
 import (
 	"fmt"
 	"math"
-	"nofx/telemetry"
 	"nofx/kernel"
 	"nofx/logger"
 	"nofx/market"
 	"nofx/store"
+	"nofx/telemetry"
 	"time"
 )
 
@@ -18,13 +18,14 @@ func (at *AutoTrader) saveEquitySnapshot(ctx *kernel.Context) {
 	}
 
 	snapshot := &store.EquitySnapshot{
-		TraderID:      at.id,
-		Timestamp:     time.Now().UTC(),
-		TotalEquity:   ctx.Account.TotalEquity,
-		Balance:       ctx.Account.TotalEquity - ctx.Account.UnrealizedPnL,
-		UnrealizedPnL: ctx.Account.UnrealizedPnL,
-		PositionCount: ctx.Account.PositionCount,
-		MarginUsedPct: ctx.Account.MarginUsedPct,
+		TraderID:         at.id,
+		Timestamp:        time.Now().UTC(),
+		TotalEquity:      ctx.Account.TotalEquity,
+		Balance:          ctx.Account.TotalEquity - ctx.Account.UnrealizedPnL,
+		AvailableBalance: ctx.Account.AvailableBalance,
+		UnrealizedPnL:    ctx.Account.UnrealizedPnL,
+		PositionCount:    ctx.Account.PositionCount,
+		MarginUsedPct:    ctx.Account.MarginUsedPct,
 	}
 
 	if err := at.store.Equity().Save(snapshot); err != nil {
@@ -34,6 +35,7 @@ func (at *AutoTrader) saveEquitySnapshot(ctx *kernel.Context) {
 
 // saveDecision saves AI decision log to database (only records AI input/output, for debugging)
 func (at *AutoTrader) saveDecision(record *store.DecisionRecord) error {
+	summarizeDecisionExecution(record)
 	if at.store == nil {
 		return nil
 	}
@@ -53,6 +55,25 @@ func (at *AutoTrader) saveDecision(record *store.DecisionRecord) error {
 
 	logger.Infof("📝 Decision record saved: trader=%s, cycle=%d", at.id, at.cycleNumber)
 	return nil
+}
+
+func summarizeDecisionExecution(record *store.DecisionRecord) {
+	failed, attempted := 0, 0
+	for _, action := range record.Decisions {
+		if action.Action == "hold" || action.Action == "wait" {
+			continue
+		}
+		attempted++
+		if !action.Success {
+			failed++
+		}
+	}
+	if failed > 0 {
+		record.Success = false
+		if record.ErrorMessage == "" {
+			record.ErrorMessage = fmt.Sprintf("%d of %d trade actions failed or were blocked", failed, attempted)
+		}
+	}
 }
 
 // GetStatus gets system status (for API)
@@ -88,6 +109,26 @@ func (at *AutoTrader) GetStatus() map[string]interface{} {
 		if at.config.StrategyConfig.GridConfig != nil {
 			result["grid_symbol"] = at.config.StrategyConfig.GridConfig.Symbol
 		}
+	}
+
+	// Runtime health: safe mode + AI fee wallet, so the dashboard can show a
+	// persistent banner instead of the user digging through logs.
+	safeMode, safeModeReason := at.safeModeState()
+	result["safe_mode"] = safeMode
+	at.runtimeHealthMu.RLock()
+	result["trading_blocked"] = at.tradingBlocked
+	result["trading_error"] = at.tradingError
+	if !at.tradingCheckedAt.IsZero() {
+		result["trading_checked_at"] = at.tradingCheckedAt.Format(time.RFC3339)
+	}
+	at.runtimeHealthMu.RUnlock()
+	if safeModeReason != "" {
+		result["safe_mode_reason"] = safeModeReason
+	}
+	if status, balance, checkedAt := at.aiWalletHealth(); status != "" {
+		result["ai_wallet_status"] = status
+		result["ai_wallet_balance_usdc"] = balance
+		result["ai_wallet_checked_at"] = checkedAt.Format(time.RFC3339)
 	}
 
 	return result

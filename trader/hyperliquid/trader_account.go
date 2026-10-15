@@ -7,10 +7,13 @@ import (
 	"io"
 	"net/http"
 	"nofx/logger"
+	"nofx/trader/execution"
 	"nofx/trader/types"
 	"strconv"
 	"strings"
 	"time"
+
+	hl "github.com/sonirico/go-hyperliquid"
 )
 
 // GetBalance gets account balance
@@ -19,14 +22,30 @@ func (t *HyperliquidTrader) GetBalance() (map[string]interface{}, error) {
 
 	// Step 1: Query Spot account balance
 	spotState, err := t.exchange.Info().SpotUserState(t.ctx, t.walletAddr)
-	var spotUSDCBalance float64 = 0.0
+	var spotUSDCBalance, spotUSDCHold float64
+	spotUSDCFound := false
 	if err != nil {
+		if t.isUnifiedAccount {
+			return nil, fmt.Errorf("failed to get authoritative unified Spot balance: %w", err)
+		}
 		logger.Infof("⚠️ Failed to query Spot balance (may have no spot assets): %v", err)
-	} else if spotState != nil && len(spotState.Balances) > 0 {
+	} else if spotState == nil {
+		if t.isUnifiedAccount {
+			return nil, fmt.Errorf("authoritative unified Spot balance response is empty")
+		}
+	} else if len(spotState.Balances) > 0 {
 		for _, balance := range spotState.Balances {
 			if balance.Coin == "USDC" {
-				spotUSDCBalance, _ = strconv.ParseFloat(balance.Total, 64)
-				logger.Infof("✓ Found Spot balance: %.2f USDC", spotUSDCBalance)
+				spotUSDCFound = true
+				spotUSDCBalance, err = types.ParseFloatField("spot USDC total", balance.Total)
+				if err != nil {
+					return nil, err
+				}
+				spotUSDCHold, err = types.ParseFloatField("spot USDC hold", balance.Hold)
+				if err != nil {
+					return nil, err
+				}
+				logger.Infof("✓ Found Spot balance: %.2f USDC (hold %.2f)", spotUSDCBalance, spotUSDCHold)
 				break
 			}
 		}
@@ -47,16 +66,25 @@ func (t *HyperliquidTrader) GetBalance() (map[string]interface{}, error) {
 	var summaryType string
 	var summary interface{}
 
+	var parseErr error
 	if t.isCrossMargin {
 		// Cross margin mode: use CrossMarginSummary
-		accountValue, _ = strconv.ParseFloat(accountState.CrossMarginSummary.AccountValue, 64)
-		totalMarginUsed, _ = strconv.ParseFloat(accountState.CrossMarginSummary.TotalMarginUsed, 64)
+		if accountValue, parseErr = types.ParseFloatField("accountValue", accountState.CrossMarginSummary.AccountValue); parseErr != nil {
+			return nil, parseErr
+		}
+		if totalMarginUsed, parseErr = types.ParseFloatField("totalMarginUsed", accountState.CrossMarginSummary.TotalMarginUsed); parseErr != nil {
+			return nil, parseErr
+		}
 		summaryType = "CrossMarginSummary (cross margin)"
 		summary = accountState.CrossMarginSummary
 	} else {
 		// Isolated margin mode: use MarginSummary
-		accountValue, _ = strconv.ParseFloat(accountState.MarginSummary.AccountValue, 64)
-		totalMarginUsed, _ = strconv.ParseFloat(accountState.MarginSummary.TotalMarginUsed, 64)
+		if accountValue, parseErr = types.ParseFloatField("accountValue", accountState.MarginSummary.AccountValue); parseErr != nil {
+			return nil, parseErr
+		}
+		if totalMarginUsed, parseErr = types.ParseFloatField("totalMarginUsed", accountState.MarginSummary.TotalMarginUsed); parseErr != nil {
+			return nil, parseErr
+		}
 		summaryType = "MarginSummary (isolated margin)"
 		summary = accountState.MarginSummary
 	}
@@ -120,23 +148,37 @@ func (t *HyperliquidTrader) GetBalance() (map[string]interface{}, error) {
 		logger.Infof("   └─ %s: size=%s, entryPx=%s, posValue=%s, pnl=%s",
 			pos.Position.Coin, pos.Position.Szi, entryPx, pos.Position.PositionValue, pos.Position.UnrealizedPnl)
 	}
-	xyzWalletBalance := xyzAccountValue - xyzUnrealizedPnl
-
-	// Step 6: Correctly handle Spot + Perpetuals + xyz dex balance
-	// Important: Each account is independent, manual transfers required
-	totalWalletBalance := walletBalanceWithoutUnrealized + spotUSDCBalance + xyzWalletBalance
-	totalUnrealizedPnlAll := totalUnrealizedPnl + xyzUnrealizedPnl
-
-	// Calculate total equity properly: perpAccountValue + spotUSDCBalance + xyzAccountValue
-	// Note: totalWalletBalance + totalUnrealizedPnlAll should equal this
-	totalEquityCalculated := accountValue + spotUSDCBalance + xyzAccountValue
+	xyzMarginUsed := calculateXYZMarginUsed(xyzPositions)
+	calculatedMarginUsed := totalMarginUsed + xyzMarginUsed
+	if t.isUnifiedAccount && !spotUSDCFound && calculatedMarginUsed > 0 {
+		return nil, fmt.Errorf("unified Spot USDC state is missing while %.4f USDC margin is in use", calculatedMarginUsed)
+	}
+	if t.isUnifiedAccount && spotUSDCHold <= 0 && calculatedMarginUsed > 0 {
+		return nil, fmt.Errorf("unified Spot hold is unavailable while %.4f USDC margin is in use", calculatedMarginUsed)
+	}
+	balanceBreakdown := calculateHyperliquidBalanceBreakdown(
+		t.isUnifiedAccount,
+		spotUSDCBalance,
+		spotUSDCHold,
+		accountValue,
+		totalUnrealizedPnl,
+		totalMarginUsed,
+		availableBalance,
+		xyzAccountValue,
+		xyzUnrealizedPnl,
+		xyzMarginUsed,
+	)
+	totalWalletBalance := balanceBreakdown.TotalWalletBalance
+	totalUnrealizedPnlAll := balanceBreakdown.TotalUnrealizedProfit
+	totalEquityCalculated := balanceBreakdown.TotalEquity
+	availableBalance = balanceBreakdown.AvailableBalance
 
 	// Step 7: Unified Account mode - Spot USDC is used as collateral for Perps
-	// In this mode, available balance includes Spot USDC since it can be used for Perp margin
+	// In this mode, xyz/core account values are collateral views backed by the
+	// same Spot USDC. They must not be added on top of Spot or the dashboard
+	// will double count equity after a position opens.
 	if t.isUnifiedAccount && spotUSDCBalance > 0 {
-		// Add Spot balance to available balance for trading
-		availableBalance = availableBalance + spotUSDCBalance
-		logger.Infof("✓ Unified Account: Spot %.2f USDC added to available balance (total: %.2f)",
+		logger.Infof("✓ Unified Account: Spot %.2f USDC used as shared collateral (available: %.2f)",
 			spotUSDCBalance, availableBalance)
 	}
 
@@ -144,13 +186,15 @@ func (t *HyperliquidTrader) GetBalance() (map[string]interface{}, error) {
 	_ = totalUnrealizedPnlAll
 
 	result["totalWalletBalance"] = totalWalletBalance       // Total assets (Perp + Spot + xyz) - unrealized
-	result["totalEquity"] = totalEquityCalculated           // Total equity = Perp AV + Spot + xyz AV
+	result["totalEquity"] = totalEquityCalculated           // Mark-to-market total equity
 	result["availableBalance"] = availableBalance           // Available balance (Perp + Spot if unified)
+	result["heldBalance"] = spotUSDCHold                    // Unified Spot funds held/reserved by Hyperliquid
 	result["totalUnrealizedProfit"] = totalUnrealizedPnlAll // Unrealized PnL (Perpetuals + xyz)
 	result["spotBalance"] = spotUSDCBalance                 // Spot balance
 	result["xyzDexBalance"] = xyzAccountValue               // xyz dex equity (stock perps, forex, commodities)
 	result["xyzDexUnrealizedPnl"] = xyzUnrealizedPnl        // xyz dex unrealized PnL
 	result["perpAccountValue"] = accountValue               // Perp account value for debugging
+	result["totalMarginUsed"] = balanceBreakdown.TotalMarginUsed
 
 	logger.Infof("✓ Hyperliquid complete account:")
 	logger.Infof("  • Spot balance: %.2f USDC", spotUSDCBalance)
@@ -159,16 +203,105 @@ func (t *HyperliquidTrader) GetBalance() (map[string]interface{}, error) {
 		walletBalanceWithoutUnrealized,
 		totalUnrealizedPnl)
 	logger.Infof("  • Perpetuals available balance: %.2f USDC", availableBalance)
-	logger.Infof("  • Margin used: %.2f USDC", totalMarginUsed)
+	logger.Infof("  • Margin used (position estimate): %.2f USDC", balanceBreakdown.TotalMarginUsed)
+	logger.Infof("  • Held/reserved balance: %.2f USDC", spotUSDCHold)
 	logger.Infof("  • xyz dex equity: %.2f USDC (wallet %.2f + unrealized %.2f)",
 		xyzAccountValue,
-		xyzWalletBalance,
+		balanceBreakdown.XYZWalletBalance,
 		xyzUnrealizedPnl)
-	logger.Infof("  • Total assets (Perp+Spot+xyz): %.2f USDC", totalWalletBalance)
-	logger.Infof("  ⭐ Total: %.2f USDC | Perp: %.2f | Spot: %.2f | xyz: %.2f",
-		totalWalletBalance, availableBalance, spotUSDCBalance, xyzAccountValue)
+	logger.Infof("  • Total wallet balance: %.2f USDC", totalWalletBalance)
+	logger.Infof("  ⭐ Total equity: %.2f USDC | Available: %.2f | Spot: %.2f | xyz view: %.2f",
+		totalEquityCalculated, availableBalance, spotUSDCBalance, xyzAccountValue)
 
 	return result, nil
+}
+
+type hyperliquidBalanceBreakdown struct {
+	TotalWalletBalance    float64
+	TotalEquity           float64
+	AvailableBalance      float64
+	TotalUnrealizedProfit float64
+	TotalMarginUsed       float64
+	PerpWalletBalance     float64
+	XYZWalletBalance      float64
+}
+
+func calculateHyperliquidBalanceBreakdown(
+	isUnifiedAccount bool,
+	spotUSDCBalance float64,
+	spotUSDCHold float64,
+	perpAccountValue float64,
+	perpUnrealizedPnl float64,
+	perpMarginUsed float64,
+	perpWithdrawable float64,
+	xyzAccountValue float64,
+	xyzUnrealizedPnl float64,
+	xyzMarginUsed float64,
+) hyperliquidBalanceBreakdown {
+	perpWalletBalance := perpAccountValue - perpUnrealizedPnl
+	xyzWalletBalance := xyzAccountValue - xyzUnrealizedPnl
+	totalUnrealizedPnl := perpUnrealizedPnl + xyzUnrealizedPnl
+	totalMarginUsed := perpMarginUsed + xyzMarginUsed
+
+	if isUnifiedAccount {
+		// In Hyperliquid unified accounts, Spot USDC total is already the
+		// mark-to-market account equity: the exchange updates it as unrealized PnL
+		// changes. Adding perp/xyz unrealized PnL again would double-count gains
+		// and losses. Derive the pre-PnL wallet balance only for fields that need
+		// that legacy distinction.
+		totalEquity := spotUSDCBalance
+		totalWalletBalance := totalEquity - totalUnrealizedPnl
+		// Spot hold is the authoritative account-level reservation. It can include
+		// more than position margin, so use it for availability without relabeling
+		// it as TotalMarginUsed.
+		availableBalance := totalEquity - spotUSDCHold
+		if availableBalance < 0 {
+			availableBalance = 0
+		}
+		return hyperliquidBalanceBreakdown{
+			TotalWalletBalance:    totalWalletBalance,
+			TotalEquity:           totalEquity,
+			AvailableBalance:      availableBalance,
+			TotalUnrealizedProfit: totalUnrealizedPnl,
+			TotalMarginUsed:       totalMarginUsed,
+			PerpWalletBalance:     perpWalletBalance,
+			XYZWalletBalance:      xyzWalletBalance,
+		}
+	}
+
+	availableBalance := perpWithdrawable
+	if availableBalance == 0 {
+		availableBalance = perpAccountValue - perpMarginUsed
+	}
+	if availableBalance < 0 {
+		availableBalance = 0
+	}
+
+	return hyperliquidBalanceBreakdown{
+		TotalWalletBalance:    perpWalletBalance + spotUSDCBalance + xyzWalletBalance,
+		TotalEquity:           perpAccountValue + spotUSDCBalance + xyzAccountValue,
+		AvailableBalance:      availableBalance,
+		TotalUnrealizedProfit: totalUnrealizedPnl,
+		TotalMarginUsed:       totalMarginUsed,
+		PerpWalletBalance:     perpWalletBalance,
+		XYZWalletBalance:      xyzWalletBalance,
+	}
+}
+
+func calculateXYZMarginUsed(positions []xyzAssetPosition) float64 {
+	total := 0.0
+	for _, pos := range positions {
+		positionValue, _ := strconv.ParseFloat(pos.Position.PositionValue, 64)
+		if positionValue < 0 {
+			positionValue = -positionValue
+		}
+		leverage := float64(pos.Position.Leverage.Value)
+		if leverage <= 0 {
+			leverage = 1
+		}
+		total += positionValue / leverage
+	}
+	return total
 }
 
 // xyzDexState represents the clearinghouse state for xyz dex
@@ -214,7 +347,7 @@ func (t *HyperliquidTrader) getXYZDexBalance() (accountValue float64, unrealized
 	}
 
 	// Determine API URL
-	apiURL := "https://api.hyperliquid.xyz/info"
+	apiURL := t.apiBaseURL() + "/info"
 	// Note: xyz dex may not be available on testnet
 
 	req, err := http.NewRequestWithContext(t.ctx, "POST", apiURL, bytes.NewBuffer(jsonBody))
@@ -306,7 +439,7 @@ func (t *HyperliquidTrader) getXyzMarketPrice(coin string) (float64, error) {
 		return 0, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	apiURL := "https://api.hyperliquid.xyz/info"
+	apiURL := t.apiBaseURL() + "/info"
 
 	req, err := http.NewRequestWithContext(t.ctx, "POST", apiURL, bytes.NewBuffer(jsonBody))
 	if err != nil {
@@ -352,51 +485,35 @@ func (t *HyperliquidTrader) getXyzMarketPrice(coin string) (float64, error) {
 	return 0, fmt.Errorf("xyz dex price not found for %s (lookup key: %s)", coin, lookupKey)
 }
 
-// GetOrderStatus gets order status
-// Hyperliquid uses IOC orders, usually filled or cancelled immediately
-// For completed orders, need to query historical records
-func (t *HyperliquidTrader) GetOrderStatus(symbol string, orderID string) (map[string]interface{}, error) {
-	// Hyperliquid's IOC orders are completed almost immediately
-	// If order was placed through this system, returned status will be FILLED
-	// Try to query open orders to determine if still pending
-	coin := convertSymbolToHyperliquid(symbol)
-
-	// First check if in open orders
-	openOrders, err := t.exchange.Info().OpenOrders(t.ctx, t.walletAddr)
+// GetOrderStatus queries the native order, including terminal states. Missing
+// orders or network failures are errors, never evidence that an order filled.
+func (t *HyperliquidTrader) GetOrderStatus(symbol, orderID string) (map[string]interface{}, error) {
+	id, err := strconv.ParseInt(orderID, 10, 64)
+	if err != nil || id <= 0 {
+		return nil, fmt.Errorf("invalid native order ID")
+	}
+	ex, coin, err := t.executionExchange(symbol)
 	if err != nil {
-		// If query fails, assume order is completed
-		return map[string]interface{}{
-			"orderId":     orderID,
-			"status":      "FILLED",
-			"avgPrice":    0.0,
-			"executedQty": 0.0,
-			"commission":  0.0,
-		}, nil
+		return nil, err
 	}
-
-	// Check if order is in open orders list
-	for _, order := range openOrders {
-		if order.Coin == coin && fmt.Sprintf("%d", order.Oid) == orderID {
-			// Order is still pending
-			return map[string]interface{}{
-				"orderId":     orderID,
-				"status":      "NEW",
-				"avgPrice":    0.0,
-				"executedQty": 0.0,
-				"commission":  0.0,
-			}, nil
-		}
+	r, err := ex.Info().QueryOrderByOid(t.ctx, t.walletAddr, id)
+	if err != nil || r == nil || r.Status != hl.OrderQueryStatusSuccess {
+		return nil, fmt.Errorf("Hyperliquid order status unconfirmed")
 	}
-
-	// Order not in open list, meaning completed or cancelled
-	// Hyperliquid IOC orders not in open list are usually filled
-	return map[string]interface{}{
-		"orderId":     orderID,
-		"status":      "FILLED",
-		"avgPrice":    0.0, // Hyperliquid does not directly return execution price, need to get from position info
-		"executedQty": 0.0,
-		"commission":  0.0,
-	}, nil
+	native := r.Order.Order
+	if native.Oid != id || native.Coin != coin {
+		return nil, fmt.Errorf("Hyperliquid order identity mismatch")
+	}
+	o, err := executionOrderState(execution.Order{OrderID: orderID, Quantity: execution.Decimal(native.OrigSz), Filled: "0"}, native, r.Order.Status)
+	if err != nil {
+		return nil, err
+	}
+	filled, err := strconv.ParseFloat(string(o.Filled), 64)
+	if err != nil {
+		return nil, err
+	}
+	// This endpoint reports filled size, not volume-weighted fill price or fees.
+	return map[string]interface{}{"orderId": orderID, "status": o.Status, "avgPrice": 0.0, "executedQty": filled, "commission": 0.0}, nil
 }
 
 // GetClosedPnL gets recent closing trades from Hyperliquid
@@ -454,15 +571,23 @@ func (t *HyperliquidTrader) GetClosedPnL(startTime time.Time, limit int) ([]type
 
 // GetTrades retrieves trade history from Hyperliquid
 func (t *HyperliquidTrader) GetTrades(startTime time.Time, limit int) ([]types.TradeRecord, error) {
-	// Use UserFillsByTime API
+	// Use UserFills (returns up to 2000 recent fills) rather than
+	// UserFillsByTime, which is hard-capped at 100 fills per response. At
+	// this trading frequency the account exceeds 100 fills/24h, so
+	// UserFillsByTime silently dropped ~20% of fills — skewing recorded PnL
+	// and fees away from the exchange truth. 2000 recent fills covers many
+	// days of history; we filter to startTime client-side.
 	startTimeMs := startTime.UnixMilli()
-	fills, err := t.exchange.Info().UserFillsByTime(t.ctx, t.walletAddr, startTimeMs, nil, nil)
+	fills, err := t.exchange.Info().UserFills(t.ctx, hl.UserFillsParams{Address: t.walletAddr})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user fills: %w", err)
 	}
 
 	var trades []types.TradeRecord
 	for _, fill := range fills {
+		if fill.Time < startTimeMs {
+			continue
+		}
 		price, _ := strconv.ParseFloat(fill.Price, 64)
 		qty, _ := strconv.ParseFloat(fill.Size, 64)
 		fee, _ := strconv.ParseFloat(fill.Fee, 64)
@@ -526,35 +651,47 @@ func (t *HyperliquidTrader) GetTrades(startTime time.Time, limit int) ([]types.T
 
 // GetOpenOrders gets all open/pending orders for a symbol
 func (t *HyperliquidTrader) GetOpenOrders(symbol string) ([]types.OpenOrder, error) {
-	openOrders, err := t.exchange.Info().OpenOrders(t.ctx, t.walletAddr)
+	coin := convertSymbolToHyperliquid(strings.TrimSuffix(strings.ToUpper(symbol), "USDT"))
+	request := map[string]any{"type": "frontendOpenOrders", "user": t.walletAddr}
+	if strings.HasPrefix(coin, "xyz:") {
+		request["dex"] = "xyz"
+	}
+	raw, err := t.directAccountInfo(t.ctx, request)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get open orders: %w", err)
 	}
-
-	var result []types.OpenOrder
-	for _, order := range openOrders {
-		if order.Coin != symbol {
+	var orders []hl.FrontendOpenOrder
+	if err := json.Unmarshal(raw, &orders); err != nil {
+		return nil, fmt.Errorf("invalid open order response: %w", err)
+	}
+	result := make([]types.OpenOrder, 0)
+	for _, o := range orders {
+		if o.Coin != coin {
 			continue
 		}
-
-		side := "BUY"
-		if order.Side == "A" {
+		side, positionSide, kind := "BUY", "", "LIMIT"
+		if o.Side == hl.OrderSideAsk {
 			side = "SELL"
 		}
-
-		result = append(result, types.OpenOrder{
-			OrderID:      fmt.Sprintf("%d", order.Oid),
-			Symbol:       order.Coin,
-			Side:         side,
-			PositionSide: "",
-			Type:         "LIMIT",
-			Price:        order.LimitPx,
-			StopPrice:    0,
-			Quantity:     order.Size,
-			Status:       "NEW",
-		})
+		if o.ReduceOnly {
+			if side == "BUY" {
+				positionSide = "SHORT"
+			} else {
+				positionSide = "LONG"
+			}
+		}
+		switch {
+		case strings.Contains(strings.ToLower(o.OrderType), "take profit"):
+			kind = "TAKE_PROFIT"
+		case strings.Contains(strings.ToLower(o.OrderType), "stop"):
+			kind = "STOP"
+		case o.IsTrigger:
+			kind = "TRIGGER"
+		}
+		result = append(result, types.OpenOrder{OrderID: fmt.Sprint(o.Oid), Symbol: o.Coin,
+			Side: side, PositionSide: positionSide, Type: kind, Price: o.LimitPx,
+			StopPrice: o.TriggerPx, Quantity: o.Sz, Status: "NEW"})
 	}
-
 	return result, nil
 }
 

@@ -2,11 +2,13 @@ package hyperliquid
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"nofx/logger"
+	"nofx/trader/execution"
 	"nofx/trader/types"
 	"strconv"
 	"strings"
@@ -15,8 +17,57 @@ import (
 	"github.com/sonirico/go-hyperliquid"
 )
 
+// Aggressive limit prices simulate market orders: buy slightly above and sell
+// slightly below the current price so IOC limit orders fill immediately while
+// capping slippage at 1%.
+const (
+	aggressiveBuyPriceFactor  = 1.01
+	aggressiveSellPriceFactor = 0.99
+)
+
+// submitNativeOrder is the single SDK submission point used by NOFX's
+// legacy trading methods and the exact order API. Both retain Builder routing.
+func (t *HyperliquidTrader) submitNativeOrder(ctx context.Context, ex *hyperliquid.Exchange, order hyperliquid.CreateOrderRequest) (hyperliquid.OrderStatus, error) {
+	receipt, err := ex.Order(ctx, order, defaultBuilder)
+	if err != nil {
+		return receipt, wrapBuilderFeeNotApproved(err)
+	}
+	if receipt.Error != nil {
+		return receipt, fmt.Errorf("Hyperliquid rejected order")
+	}
+	if receipt.Resting == nil && receipt.Filled == nil {
+		return receipt, fmt.Errorf("Hyperliquid missing native order receipt")
+	}
+	return receipt, nil
+}
+func (t *HyperliquidTrader) placeOrderWithBuilderFee(order hyperliquid.CreateOrderRequest) error {
+	_, err := t.submitNativeOrder(t.ctx, t.exchange, order)
+	return err
+}
+
+func isBuilderFeeNotApprovedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "builder fee has not been approved")
+}
+
+func wrapBuilderFeeNotApproved(err error) error {
+	if isBuilderFeeNotApprovedError(err) {
+		return fmt.Errorf("Hyperliquid builder fee is not approved for NOFX; reconnect Hyperliquid wallet and complete trading authorization: %w", err)
+	}
+	return err
+}
+
 // OpenLong opens a long position (supports both crypto and xyz dex)
 func (t *HyperliquidTrader) OpenLong(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
+	if err := t.CheckTradingAuthorization(); err != nil {
+		return nil, err
+	}
+	// Fail closed before touching protective orders if leverage cannot be set.
+	if err := t.SetLeverage(symbol, leverage); err != nil {
+		return nil, err
+	}
 	// First cancel all pending orders for this coin
 	if err := t.CancelAllOrders(symbol); err != nil {
 		logger.Infof("  ⚠ Failed to cancel old pending orders: %v", err)
@@ -28,15 +79,6 @@ func (t *HyperliquidTrader) OpenLong(symbol string, quantity float64, leverage i
 	// Check if this is an xyz dex asset
 	isXyz := strings.HasPrefix(coin, "xyz:")
 
-	// Set leverage (skip for xyz dex as it may not support leverage adjustment)
-	if !isXyz {
-		if err := t.SetLeverage(symbol, leverage); err != nil {
-			return nil, err
-		}
-	} else {
-		logger.Infof("  ℹ xyz dex asset %s - using default leverage", coin)
-	}
-
 	// Get current price (for market order)
 	price, err := t.GetMarketPrice(symbol)
 	if err != nil {
@@ -44,8 +86,11 @@ func (t *HyperliquidTrader) OpenLong(symbol string, quantity float64, leverage i
 	}
 
 	// Price needs to be processed to 5 significant figures
-	aggressivePrice := t.roundPriceToSigfigs(price * 1.01)
-	logger.Infof("  💰 Price precision handling: %.8f -> %.8f (5 significant figures)", price*1.01, aggressivePrice)
+	aggressivePrice, err := t.roundOrderPrice(coin, price*aggressiveBuyPriceFactor)
+	if err != nil {
+		return nil, err
+	}
+	logger.Infof("  💰 Price precision handling: %.8f -> %.8f (5 significant figures)", price*aggressiveBuyPriceFactor, aggressivePrice)
 
 	// Handle xyz dex assets differently
 	if isXyz {
@@ -71,7 +116,7 @@ func (t *HyperliquidTrader) OpenLong(symbol string, quantity float64, leverage i
 			ReduceOnly: false,
 		}
 
-		_, err = t.exchange.Order(t.ctx, order, defaultBuilder)
+		err = t.placeOrderWithBuilderFee(order)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open long position: %w", err)
 		}
@@ -89,6 +134,12 @@ func (t *HyperliquidTrader) OpenLong(symbol string, quantity float64, leverage i
 
 // OpenShort opens a short position (supports both crypto and xyz dex)
 func (t *HyperliquidTrader) OpenShort(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
+	if err := t.CheckTradingAuthorization(); err != nil {
+		return nil, err
+	}
+	if err := t.SetLeverage(symbol, leverage); err != nil {
+		return nil, err
+	}
 	// First cancel all pending orders for this coin
 	if err := t.CancelAllOrders(symbol); err != nil {
 		logger.Infof("  ⚠ Failed to cancel old pending orders: %v", err)
@@ -100,15 +151,6 @@ func (t *HyperliquidTrader) OpenShort(symbol string, quantity float64, leverage 
 	// Check if this is an xyz dex asset
 	isXyz := strings.HasPrefix(coin, "xyz:")
 
-	// Set leverage (skip for xyz dex)
-	if !isXyz {
-		if err := t.SetLeverage(symbol, leverage); err != nil {
-			return nil, err
-		}
-	} else {
-		logger.Infof("  ℹ xyz dex asset %s - using default leverage", coin)
-	}
-
 	// Get current price
 	price, err := t.GetMarketPrice(symbol)
 	if err != nil {
@@ -116,8 +158,11 @@ func (t *HyperliquidTrader) OpenShort(symbol string, quantity float64, leverage 
 	}
 
 	// Price needs to be processed to 5 significant figures
-	aggressivePrice := t.roundPriceToSigfigs(price * 0.99)
-	logger.Infof("  💰 Price precision handling: %.8f -> %.8f (5 significant figures)", price*0.99, aggressivePrice)
+	aggressivePrice, err := t.roundOrderPrice(coin, price*aggressiveSellPriceFactor)
+	if err != nil {
+		return nil, err
+	}
+	logger.Infof("  💰 Price precision handling: %.8f -> %.8f (5 significant figures)", price*aggressiveSellPriceFactor, aggressivePrice)
 
 	// Handle xyz dex assets differently
 	if isXyz {
@@ -143,7 +188,7 @@ func (t *HyperliquidTrader) OpenShort(symbol string, quantity float64, leverage 
 			ReduceOnly: false,
 		}
 
-		_, err = t.exchange.Order(t.ctx, order, defaultBuilder)
+		err = t.placeOrderWithBuilderFee(order)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open short position: %w", err)
 		}
@@ -161,6 +206,9 @@ func (t *HyperliquidTrader) OpenShort(symbol string, quantity float64, leverage 
 
 // CloseLong closes a long position (supports both crypto and xyz dex)
 func (t *HyperliquidTrader) CloseLong(symbol string, quantity float64) (map[string]interface{}, error) {
+	if err := t.CheckTradingAuthorization(); err != nil {
+		return nil, err
+	}
 	// Hyperliquid symbol format
 	coin := convertSymbolToHyperliquid(symbol)
 	isXyz := strings.HasPrefix(coin, "xyz:")
@@ -198,8 +246,11 @@ func (t *HyperliquidTrader) CloseLong(symbol string, quantity float64) (map[stri
 	}
 
 	// Price needs to be processed to 5 significant figures
-	aggressivePrice := t.roundPriceToSigfigs(price * 0.99)
-	logger.Infof("  💰 Price precision handling: %.8f -> %.8f (5 significant figures)", price*0.99, aggressivePrice)
+	aggressivePrice, err := t.roundOrderPrice(coin, price*aggressiveSellPriceFactor)
+	if err != nil {
+		return nil, err
+	}
+	logger.Infof("  💰 Price precision handling: %.8f -> %.8f (5 significant figures)", price*aggressiveSellPriceFactor, aggressivePrice)
 
 	// Handle xyz dex assets differently
 	if isXyz {
@@ -225,7 +276,7 @@ func (t *HyperliquidTrader) CloseLong(symbol string, quantity float64) (map[stri
 			ReduceOnly: true,
 		}
 
-		_, err = t.exchange.Order(t.ctx, order, defaultBuilder)
+		err = t.placeOrderWithBuilderFee(order)
 		if err != nil {
 			return nil, fmt.Errorf("failed to close long position: %w", err)
 		}
@@ -248,6 +299,9 @@ func (t *HyperliquidTrader) CloseLong(symbol string, quantity float64) (map[stri
 
 // CloseShort closes a short position (supports both crypto and xyz dex)
 func (t *HyperliquidTrader) CloseShort(symbol string, quantity float64) (map[string]interface{}, error) {
+	if err := t.CheckTradingAuthorization(); err != nil {
+		return nil, err
+	}
 	// Hyperliquid symbol format
 	coin := convertSymbolToHyperliquid(symbol)
 	isXyz := strings.HasPrefix(coin, "xyz:")
@@ -285,8 +339,11 @@ func (t *HyperliquidTrader) CloseShort(symbol string, quantity float64) (map[str
 	}
 
 	// Price needs to be processed to 5 significant figures
-	aggressivePrice := t.roundPriceToSigfigs(price * 1.01)
-	logger.Infof("  💰 Price precision handling: %.8f -> %.8f (5 significant figures)", price*1.01, aggressivePrice)
+	aggressivePrice, err := t.roundOrderPrice(coin, price*aggressiveBuyPriceFactor)
+	if err != nil {
+		return nil, err
+	}
+	logger.Infof("  💰 Price precision handling: %.8f -> %.8f (5 significant figures)", price*aggressiveBuyPriceFactor, aggressivePrice)
 
 	// Handle xyz dex assets differently
 	if isXyz {
@@ -312,7 +369,7 @@ func (t *HyperliquidTrader) CloseShort(symbol string, quantity float64) (map[str
 			ReduceOnly: true,
 		}
 
-		_, err = t.exchange.Order(t.ctx, order, defaultBuilder)
+		err = t.placeOrderWithBuilderFee(order)
 		if err != nil {
 			return nil, fmt.Errorf("failed to close short position: %w", err)
 		}
@@ -341,12 +398,118 @@ func (t *HyperliquidTrader) CancelStopLossOrders(symbol string) error {
 	return t.CancelStopOrders(symbol)
 }
 
-// CancelTakeProfitOrders only cancels take profit orders (Hyperliquid cannot distinguish stop loss and take profit, cancel all)
+type directOpenOrder struct {
+	Coin       string `json:"coin"`
+	Side       string `json:"side"`
+	LimitPx    string `json:"limitPx"`
+	Oid        int64  `json:"oid"`
+	ReduceOnly bool   `json:"reduceOnly"`
+}
+
+func isTakeProfitOrder(positionSide, orderSide string, orderPrice, markPrice float64) bool {
+	if orderPrice <= 0 || markPrice <= 0 {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(positionSide)) {
+	case "long":
+		return strings.EqualFold(strings.TrimSpace(orderSide), "A") && orderPrice > markPrice
+	case "short":
+		return strings.EqualFold(strings.TrimSpace(orderSide), "B") && orderPrice < markPrice
+	default:
+		return false
+	}
+}
+
+func (t *HyperliquidTrader) getDirectOpenOrders(isXyz bool) ([]directOpenOrder, error) {
+	reqBody := map[string]interface{}{
+		"type": "openOrders",
+		"user": t.walletAddr,
+	}
+	if isXyz {
+		reqBody["dex"] = "xyz"
+	}
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal open-orders request: %w", err)
+	}
+	apiURL := "https://api.hyperliquid.xyz/info"
+	if t.isTestnet {
+		apiURL = "https://api.hyperliquid-testnet.xyz/info"
+	}
+	req, err := http.NewRequestWithContext(t.ctx, http.MethodPost, apiURL, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create open-orders request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query open orders: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read open orders: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("openOrders API error (status %d): %s", resp.StatusCode, string(body))
+	}
+	var orders []directOpenOrder
+	if err := json.Unmarshal(body, &orders); err != nil {
+		return nil, fmt.Errorf("failed to parse open orders: %w", err)
+	}
+	return orders, nil
+}
+
+// CancelTakeProfitOrders removes only reduce-only orders on the profitable
+// side of the mark price. Protective stops remain active.
 func (t *HyperliquidTrader) CancelTakeProfitOrders(symbol string) error {
-	// Hyperliquid SDK's OpenOrder structure does not expose trigger field
-	// Cannot distinguish stop loss and take profit orders, so cancel all pending orders for this coin
-	logger.Infof("  ⚠️ Hyperliquid cannot distinguish stop loss/take profit orders, will cancel all pending orders")
-	return t.CancelStopOrders(symbol)
+	coin := convertSymbolToHyperliquid(symbol)
+	isXyz := strings.HasPrefix(coin, "xyz:")
+	positions, err := t.GetPositions()
+	if err != nil {
+		return fmt.Errorf("failed to inspect position before canceling take profit: %w", err)
+	}
+	positionSide := ""
+	markPrice := 0.0
+	for _, position := range positions {
+		positionSymbol, _ := position["symbol"].(string)
+		if convertSymbolToHyperliquid(positionSymbol) != coin {
+			continue
+		}
+		positionSide, _ = position["side"].(string)
+		markPrice, _ = position["markPrice"].(float64)
+		break
+	}
+	if positionSide == "" || markPrice <= 0 {
+		return nil
+	}
+	orders, err := t.getDirectOpenOrders(isXyz)
+	if err != nil {
+		return err
+	}
+	canceledCount := 0
+	for _, order := range orders {
+		if order.Coin != coin || !order.ReduceOnly {
+			continue
+		}
+		orderPrice, err := strconv.ParseFloat(order.LimitPx, 64)
+		if err != nil || !isTakeProfitOrder(positionSide, order.Side, orderPrice, markPrice) {
+			continue
+		}
+		if isXyz {
+			err = t.cancelXyzOrder(coin, order.Oid)
+		} else {
+			_, err = t.exchange.Cancel(t.ctx, coin, order.Oid)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to cancel take-profit order %d: %w", order.Oid, err)
+		}
+		canceledCount++
+	}
+	if canceledCount > 0 {
+		logger.Infof("  ✓ Cancelled %d fixed take-profit order(s) for signal-managed %s", canceledCount, symbol)
+	}
+	return nil
 }
 
 // CancelAllOrders cancels all pending orders for this coin
@@ -474,7 +637,7 @@ func (t *HyperliquidTrader) cancelXyzOrders(coin string) error {
 	canceledCount := 0
 	for _, order := range openOrders {
 		if order.Coin == coin {
-			if err := t.cancelXyzOrder(order.Oid); err != nil {
+			if err := t.cancelXyzOrder(coin, order.Oid); err != nil {
 				logger.Infof("  ⚠ Failed to cancel xyz dex order (oid=%d): %v", order.Oid, err)
 				continue
 			}
@@ -492,17 +655,27 @@ func (t *HyperliquidTrader) cancelXyzOrders(coin string) error {
 }
 
 // cancelXyzOrder cancels a single xyz dex order by oid
-func (t *HyperliquidTrader) cancelXyzOrder(oid int64) error {
-	// Get asset index for this order (we need it for cancel action)
-	// For cancel, we construct a cancel action with the oid
+func (t *HyperliquidTrader) cancelXyzOrder(coin string, oid int64) error {
+	t.xyzMetaMutex.RLock()
+	hasMeta := t.xyzMeta != nil
+	t.xyzMetaMutex.RUnlock()
+	if !hasMeta {
+		if err := t.fetchXyzMeta(); err != nil {
+			return fmt.Errorf("failed to fetch xyz meta: %w", err)
+		}
+	}
+	metaIndex := t.getXyzAssetIndex(coin)
+	if metaIndex < 0 {
+		return fmt.Errorf("xyz asset %s not found in meta", coin)
+	}
+	const xyzPerpDexIndex = 1
+	assetIndex := 100000 + xyzPerpDexIndex*10000 + metaIndex
 
-	action := map[string]interface{}{
-		"type": "cancel",
-		"cancels": []map[string]interface{}{
-			{
-				"a": oid, // asset index not needed for cancel by oid in xyz dex
-				"o": oid,
-			},
+	action := hyperliquid.CancelAction{
+		Type: "cancel",
+		Dex:  "xyz",
+		Cancels: []hyperliquid.CancelOrderWire{
+			{Asset: assetIndex, OrderID: oid},
 		},
 	}
 
@@ -614,7 +787,10 @@ func (t *HyperliquidTrader) placeXyzOrder(coin string, isBuy bool, size float64,
 	roundedSize := float64(int(size*multiplier+0.5)) / multiplier
 
 	// Round price to 5 significant figures
-	roundedPrice := t.roundPriceToSigfigs(price)
+	roundedPrice, err := t.roundOrderPrice(coin, price)
+	if err != nil {
+		return err
+	}
 
 	logger.Infof("📝 Placing xyz dex order (direct): %s %s size=%.4f price=%.4f metaIndex=%d assetIndex=%d (formula: 100000 + 1*10000 + %d) reduceOnly=%v",
 		map[bool]string{true: "BUY", false: "SELL"}[isBuy],
@@ -634,12 +810,13 @@ func (t *HyperliquidTrader) placeXyzOrder(coin string, isBuy bool, size float64,
 		},
 	}
 
-	// Create OrderAction (no builder to avoid requiring builder fee approval)
+	// Create OrderAction with NOFX builder fee. Trader startup requires a persisted
+	// builder approval flag before this live path can run.
 	action := hyperliquid.OrderAction{
 		Type:     "order",
 		Orders:   []hyperliquid.OrderWire{orderWire},
 		Grouping: "na",
-		Builder:  nil,
+		Builder:  defaultBuilder,
 	}
 
 	// Sign the action
@@ -727,7 +904,7 @@ func (t *HyperliquidTrader) placeXyzOrder(coin string, isBuy bool, size float64,
 	if len(result.Response.Data.Statuses) > 0 {
 		status := result.Response.Data.Statuses[0]
 		if status.Error != nil {
-			return fmt.Errorf("xyz dex order error (coin=%s, assetIndex=%d, size=%.4f, price=%.4f): %s", coin, assetIndex, roundedSize, roundedPrice, *status.Error)
+			return wrapBuilderFeeNotApproved(fmt.Errorf("xyz dex order error (coin=%s, assetIndex=%d, size=%.4f, price=%.4f): %s", coin, assetIndex, roundedSize, roundedPrice, *status.Error))
 		}
 		if status.Filled != nil {
 			logger.Infof("✅ xyz dex order filled: totalSz=%s avgPx=%s oid=%d",
@@ -775,7 +952,10 @@ func (t *HyperliquidTrader) placeXyzTriggerOrder(coin string, isBuy bool, size f
 	roundedSize := float64(int(size*multiplier+0.5)) / multiplier
 
 	// Round price to 5 significant figures
-	roundedPrice := t.roundPriceToSigfigs(triggerPrice)
+	roundedPrice, err := t.roundOrderPrice(coin, triggerPrice)
+	if err != nil {
+		return err
+	}
 
 	logger.Infof("📝 Placing xyz dex %s order: %s %s size=%.4f triggerPrice=%.4f assetIndex=%d",
 		tpsl,
@@ -798,12 +978,13 @@ func (t *HyperliquidTrader) placeXyzTriggerOrder(coin string, isBuy bool, size f
 		},
 	}
 
-	// Create OrderAction (no builder to avoid requiring builder fee approval)
+	// Create OrderAction with NOFX builder fee. Trader startup requires a persisted
+	// builder approval flag before this live path can run.
 	action := hyperliquid.OrderAction{
 		Type:     "order",
 		Orders:   []hyperliquid.OrderWire{orderWire},
 		Grouping: "na",
-		Builder:  nil,
+		Builder:  defaultBuilder,
 	}
 
 	// Sign the action
@@ -885,7 +1066,7 @@ func (t *HyperliquidTrader) placeXyzTriggerOrder(coin string, isBuy bool, size f
 	if len(result.Response.Data.Statuses) > 0 {
 		status := result.Response.Data.Statuses[0]
 		if status.Error != nil {
-			return fmt.Errorf("xyz dex %s order error: %s", tpsl, *status.Error)
+			return wrapBuilderFeeNotApproved(fmt.Errorf("xyz dex %s order error: %s", tpsl, *status.Error))
 		}
 		if status.Resting != nil {
 			logger.Infof("✅ xyz dex %s order placed: oid=%d", tpsl, status.Resting.Oid)
@@ -903,7 +1084,10 @@ func (t *HyperliquidTrader) SetStopLoss(symbol string, positionSide string, quan
 	isBuy := positionSide == "SHORT" // Short position stop loss = buy, long position stop loss = sell
 
 	// Price needs to be processed to 5 significant figures
-	roundedStopPrice := t.roundPriceToSigfigs(stopPrice)
+	roundedStopPrice, err := t.roundOrderPrice(coin, stopPrice)
+	if err != nil {
+		return err
+	}
 
 	// Check if this is an xyz dex asset (stocks, forex, commodities)
 	isXyz := strings.HasPrefix(coin, "xyz:")
@@ -934,7 +1118,7 @@ func (t *HyperliquidTrader) SetStopLoss(symbol string, positionSide string, quan
 			ReduceOnly: true,
 		}
 
-		_, err := t.exchange.Order(t.ctx, order, defaultBuilder)
+		err := t.placeOrderWithBuilderFee(order)
 		if err != nil {
 			return fmt.Errorf("failed to set stop loss: %w", err)
 		}
@@ -951,7 +1135,10 @@ func (t *HyperliquidTrader) SetTakeProfit(symbol string, positionSide string, qu
 	isBuy := positionSide == "SHORT" // Short position take profit = buy, long position take profit = sell
 
 	// Price needs to be processed to 5 significant figures
-	roundedTakeProfitPrice := t.roundPriceToSigfigs(takeProfitPrice)
+	roundedTakeProfitPrice, err := t.roundOrderPrice(coin, takeProfitPrice)
+	if err != nil {
+		return err
+	}
 
 	// Check if this is an xyz dex asset (stocks, forex, commodities)
 	isXyz := strings.HasPrefix(coin, "xyz:")
@@ -982,7 +1169,7 @@ func (t *HyperliquidTrader) SetTakeProfit(symbol string, positionSide string, qu
 			ReduceOnly: true,
 		}
 
-		_, err := t.exchange.Order(t.ctx, order, defaultBuilder)
+		err := t.placeOrderWithBuilderFee(order)
 		if err != nil {
 			return fmt.Errorf("failed to set take profit: %w", err)
 		}
@@ -995,63 +1182,38 @@ func (t *HyperliquidTrader) SetTakeProfit(symbol string, positionSide string, qu
 // PlaceLimitOrder places a limit order for grid trading
 // Implements GridTrader interface
 func (t *HyperliquidTrader) PlaceLimitOrder(req *types.LimitOrderRequest) (*types.LimitOrderResult, error) {
-	coin := convertSymbolToHyperliquid(req.Symbol)
-
-	// Set leverage if specified and not xyz dex
-	isXyz := strings.HasPrefix(coin, "xyz:")
-	if req.Leverage > 0 && !isXyz {
+	if req == nil || (req.Side != "BUY" && req.Side != "SELL") {
+		return nil, fmt.Errorf("invalid limit order request")
+	}
+	// Preserve the caller ID. Exact execution refuses silent order changes.
+	id, err := execution.CanonicalClientID(req.ClientID)
+	if err != nil {
+		return nil, err
+	}
+	if req.Leverage > 0 {
 		if err := t.SetLeverage(req.Symbol, req.Leverage); err != nil {
-			logger.Warnf("[Hyperliquid] Failed to set leverage: %v", err)
+			return nil, fmt.Errorf("order blocked: %w", err)
 		}
 	}
-
-	// Round quantity to allowed decimals
-	roundedQuantity := t.roundToSzDecimals(coin, req.Quantity)
-
-	// Round price to 5 significant figures
-	roundedPrice := t.roundPriceToSigfigs(req.Price)
-
-	// Determine if buy or sell
-	isBuy := req.Side == "BUY"
-
-	logger.Infof("[Hyperliquid] PlaceLimitOrder: %s %s @ %.4f, qty=%.4f", coin, req.Side, roundedPrice, roundedQuantity)
-
-	order := hyperliquid.CreateOrderRequest{
-		Coin:  coin,
-		IsBuy: isBuy,
-		Size:  roundedQuantity,
-		Price: roundedPrice,
-		OrderType: hyperliquid.OrderType{
-			Limit: &hyperliquid.LimitOrderType{
-				Tif: hyperliquid.TifGtc, // Good Till Cancel for grid orders
-			},
-		},
-		ReduceOnly: req.ReduceOnly,
+	side := "long"
+	if req.Side == "SELL" {
+		side = "short"
 	}
-
-	_, err := t.exchange.Order(t.ctx, order, defaultBuilder)
+	coin := convertSymbolToHyperliquid(req.Symbol)
+	quantity := strconv.FormatFloat(t.roundToSzDecimals(coin, req.Quantity), 'f', -1, 64)
+	rounded, err := t.roundOrderPrice(coin, req.Price)
 	if err != nil {
-		return nil, fmt.Errorf("failed to place limit order: %w", err)
+		return nil, err
 	}
-
-	// Note: Hyperliquid's Order response doesn't return the order ID directly
-	// We would need to query open orders to get it, but for grid trading
-	// we can track orders by price level instead
-	orderID := fmt.Sprintf("%d", time.Now().UnixNano())
-
-	logger.Infof("✓ [Hyperliquid] Limit order placed: %s %s @ %.4f",
-		coin, req.Side, roundedPrice)
-
-	return &types.LimitOrderResult{
-		OrderID:      orderID,
-		ClientID:     req.ClientID,
-		Symbol:       req.Symbol,
-		Side:         req.Side,
-		PositionSide: req.PositionSide,
-		Price:        roundedPrice,
-		Quantity:     roundedQuantity,
-		Status:       "NEW",
-	}, nil
+	price := strconv.FormatFloat(rounded, 'f', -1, 64)
+	nativeID := ""
+	result, err := t.SubmitOrder(context.Background(), execution.Order{ClientID: id, VenueClientID: nativeID, Symbol: req.Symbol, Side: side, Role: "entry", Price: execution.Decimal(price), Quantity: execution.Decimal(quantity), ReduceOnly: req.ReduceOnly, PostOnly: req.PostOnly})
+	if err != nil {
+		return nil, err
+	}
+	actualPrice, _ := strconv.ParseFloat(string(result.Price), 64)
+	actualQty, _ := strconv.ParseFloat(string(result.Quantity), 64)
+	return &types.LimitOrderResult{OrderID: result.OrderID, ClientID: result.ClientID, Symbol: req.Symbol, Side: req.Side, PositionSide: req.PositionSide, Price: actualPrice, Quantity: actualQty, Status: result.Status}, nil
 }
 
 // CancelOrder cancels a specific order by ID

@@ -7,7 +7,7 @@ interface HeaderProps {
 }
 
 export function Header({ simple = false }: HeaderProps) {
-  const { language, setLanguage } = useLanguage()
+  const { language } = useLanguage()
 
   return (
     <header className="glass sticky top-0 z-50 backdrop-blur-xl">
@@ -19,55 +19,15 @@ export function Header({ simple = false }: HeaderProps) {
               <img src="/icons/nofx.svg" alt="NoFx Logo" className="w-8 h-8" />
             </div>
             <div>
-              <h1 className="text-xl font-bold" style={{ color: '#EAECEF' }}>
+              <h1 className="text-xl font-bold" style={{ color: '#1A1813' }}>
                 {t('appTitle', language)}
               </h1>
               {!simple && (
-                <p className="text-xs mono" style={{ color: '#848E9C' }}>
+                <p className="text-xs mono" style={{ color: '#8A8478' }}>
                   {t('subtitle', language)}
                 </p>
               )}
             </div>
-          </div>
-
-          {/* Right - Language Toggle (always show) */}
-          <div
-            className="flex gap-1 rounded p-1"
-            style={{ background: '#1E2329' }}
-          >
-            <button
-              onClick={() => setLanguage('zh')}
-              className="px-3 py-1.5 rounded text-xs font-semibold transition-all"
-              style={
-                language === 'zh'
-                  ? { background: '#F0B90B', color: '#000' }
-                  : { background: 'transparent', color: '#848E9C' }
-              }
-            >
-              中文
-            </button>
-            <button
-              onClick={() => setLanguage('en')}
-              className="px-3 py-1.5 rounded text-xs font-semibold transition-all"
-              style={
-                language === 'en'
-                  ? { background: '#F0B90B', color: '#000' }
-                  : { background: 'transparent', color: '#848E9C' }
-              }
-            >
-              EN
-            </button>
-            <button
-              onClick={() => setLanguage('id')}
-              className="px-3 py-1.5 rounded text-xs font-semibold transition-all"
-              style={
-                language === 'id'
-                  ? { background: '#F0B90B', color: '#000' }
-                  : { background: 'transparent', color: '#848E9C' }
-              }
-            >
-              ID
-            </button>
           </div>
         </div>
       </Container>

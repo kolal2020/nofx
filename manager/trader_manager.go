@@ -7,6 +7,7 @@ import (
 	"nofx/store"
 	"nofx/trader"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -410,6 +411,34 @@ func (tm *TraderManager) RemoveTrader(traderID string) {
 	}
 }
 
+func ensureHyperliquidNativeStrategy(traderName, exchangeType string, cfg *store.StrategyConfig) {
+	if cfg == nil || strings.ToLower(strings.TrimSpace(exchangeType)) != "hyperliquid" {
+		return
+	}
+
+	source := strings.ToLower(strings.TrimSpace(cfg.CoinSource.SourceType))
+	if source == "hyper_rank" || source == "vergex_signal" || source == "static" || source == "hyper_all" || source == "hyper_main" {
+		return
+	}
+
+	logger.Warnf("⚠️ Trader %s uses legacy coin source %q on Hyperliquid; forcing native stock ranking to avoid crypto fallback", traderName, cfg.CoinSource.SourceType)
+	cfg.CoinSource.SourceType = "hyper_rank"
+	cfg.CoinSource.UseAI500 = false
+	cfg.CoinSource.UseOITop = false
+	cfg.CoinSource.UseOILow = false
+	cfg.CoinSource.UseHyperAll = false
+	cfg.CoinSource.UseHyperMain = false
+	if cfg.CoinSource.HyperRankCategory == "" {
+		cfg.CoinSource.HyperRankCategory = "stock"
+	}
+	if cfg.CoinSource.HyperRankDirection == "" {
+		cfg.CoinSource.HyperRankDirection = "gainers"
+	}
+	if cfg.CoinSource.HyperRankLimit <= 0 {
+		cfg.CoinSource.HyperRankLimit = 5
+	}
+}
+
 // LoadUserTradersFromStore loads traders from store for a specific user to memory
 func (tm *TraderManager) LoadUserTradersFromStore(st *store.Store, userID string) error {
 	tm.mu.Lock()
@@ -616,6 +645,7 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 
 	// Load strategy config (must have strategy)
 	var strategyConfig *store.StrategyConfig
+	strategyConfigRaw := ""
 	if traderCfg.StrategyID != "" {
 		strategy, err := st.Strategy().Get(traderCfg.UserID, traderCfg.StrategyID)
 		if err != nil {
@@ -626,15 +656,36 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 		if err != nil {
 			return fmt.Errorf("failed to parse strategy config for trader %s: %w", traderCfg.Name, err)
 		}
-		logger.Infof("✓ Trader %s loaded strategy config: %s", traderCfg.Name, strategy.Name)
+		if store.MigrateLegacyAutopilotRiskDefaults(strategyConfig) {
+			if err := strategy.SetConfig(strategyConfig); err != nil {
+				return fmt.Errorf("failed to serialize migrated strategy config for trader %s: %w", traderCfg.Name, err)
+			}
+			if err := st.Strategy().Update(strategy); err != nil {
+				logger.Warnf("⚠️ Failed to persist eight-position Autopilot migration for trader %s: %v", traderCfg.Name, err)
+			} else {
+				logger.Infof("✓ Migrated trader %s to the eight-position Autopilot book", traderCfg.Name)
+			}
+		}
+		strategyConfigRaw = strategy.Config
+		strategyConfig.ClampLimits()
+		// Sizing comes from the strategy's RiskControl. Autopilot separately
+		// distributes its margin budget across the configured slots while the
+		// per-position ratio remains a hard safety cap.
+		logger.Infof("✓ Trader %s loaded strategy config: %s (maxPos=%d, posRatio=%.1f)", traderCfg.Name, strategy.Name, strategyConfig.RiskControl.MaxPositions, strategyConfig.RiskControl.AltcoinMaxPositionValueRatio)
+		ensureHyperliquidNativeStrategy(traderCfg.Name, exchangeCfg.ExchangeType, strategyConfig)
 	} else {
 		return fmt.Errorf("trader %s has no strategy configured", traderCfg.Name)
+	}
+
+	if exchangeCfg.ExchangeType == "hyperliquid" && !exchangeCfg.HyperliquidBuilderApproved {
+		return fmt.Errorf("Hyperliquid trading authorization is incomplete for exchange %s; reconnect Hyperliquid wallet and complete trading authorization before starting trader %s", exchangeCfg.AccountName, traderCfg.Name)
 	}
 
 	// Build AutoTraderConfig (ai500APIURL/oiTopAPIURL obtained from strategy config, used in StrategyEngine)
 	traderConfig := trader.AutoTraderConfig{
 		ID:                    traderCfg.ID,
 		Name:                  traderCfg.Name,
+		StrategyID:            traderCfg.StrategyID,
 		AIModel:               aiModelCfg.Provider,
 		Exchange:              exchangeCfg.ExchangeType, // Exchange type: binance/bybit/okx/etc
 		ExchangeID:            exchangeCfg.ID,           // Exchange account UUID (for multi-account)
@@ -652,6 +703,7 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 		IsCrossMargin:         traderCfg.IsCrossMargin,
 		ShowInCompetition:     traderCfg.ShowInCompetition,
 		StrategyConfig:        strategyConfig,
+		StrategyConfigRaw:     strategyConfigRaw,
 	}
 
 	logger.Infof("📊 Loading trader %s: ScanIntervalMinutes=%d (from DB), ScanInterval=%v",

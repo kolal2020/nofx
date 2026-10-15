@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -32,10 +33,13 @@ var (
 		"no such host",
 		"stream error",   // HTTP/2 stream error
 		"INTERNAL_ERROR", // Server internal error
-		"status 502",     // Bad Gateway
-		"status 503",     // Service Unavailable
-		"status 520",     // Cloudflare origin error
-		"status 524",     // Cloudflare timeout
+		"status 429",     // Rate limit / upstream gateway throttling
+		"rate_limit_error",
+		"upstream_empty_output",
+		"status 502", // Bad Gateway
+		"status 503", // Service Unavailable
+		"status 520", // Cloudflare origin error
+		"status 524", // Cloudflare timeout
 	}
 
 	// TokenUsageCallback is called after each AI request with token usage info
@@ -74,6 +78,16 @@ type Client struct {
 	HTTPClient *http.Client // Exported for sub-packages
 	Log        Logger       // Exported for sub-packages
 	Cfg        *Config      // Exported for sub-packages
+
+	// LastCallSettledUSD is the independently verified cost of the last upto
+	// call, from a JSON receipt or SSE settlement event. The separate verified
+	// flag distinguishes a confirmed zero charge from missing payment evidence.
+	LastCallSettledUSD         float64
+	LastCallSettlementVerified bool
+
+	// LastCallUsage is the token usage of the most recent streamed call.
+	// Token usage is informational; it is not proof of payment or a refund.
+	LastCallUsage *TokenUsage
 
 	// Hooks are used to implement dynamic dispatch (polymorphism)
 	// When provider.DeepSeekClient embeds Client, Hooks point to DeepSeekClient
@@ -197,7 +211,9 @@ func (client *Client) CallWithMessages(systemPrompt, userPrompt string) (string,
 		if attempt < maxRetries {
 			waitTime := client.Cfg.RetryWaitBase * time.Duration(attempt)
 			client.Log.Infof("⏳ Waiting %v before retry...", waitTime)
-			time.Sleep(waitTime)
+			if err := sleepWithContext(context.Background(), waitTime); err != nil {
+				return "", err
+			}
 		}
 	}
 
@@ -206,6 +222,19 @@ func (client *Client) CallWithMessages(systemPrompt, userPrompt string) (string,
 
 func (client *Client) SetAuthHeader(reqHeader http.Header) {
 	reqHeader.Set("Authorization", fmt.Sprintf("Bearer %s", client.APIKey))
+}
+
+// modelSupportsCustomTemperature reports whether the target model accepts a
+// non-default temperature. OpenAI reasoning models (gpt-5/6 families, o-series)
+// reject any value other than the default and fail the whole request with
+// "unsupported_value", so temperature must be omitted for them.
+func modelSupportsCustomTemperature(model string) bool {
+	m := strings.ToLower(model)
+	return !strings.HasPrefix(m, "gpt-5") &&
+		!strings.HasPrefix(m, "gpt-6") &&
+		!strings.HasPrefix(m, "o1") &&
+		!strings.HasPrefix(m, "o3") &&
+		!strings.HasPrefix(m, "o4")
 }
 
 func (client *Client) BuildMCPRequestBody(systemPrompt, userPrompt string) map[string]any {
@@ -237,9 +266,11 @@ func (client *Client) BuildMCPRequestBody(systemPrompt, userPrompt string) map[s
 
 	// Build request body
 	requestBody := map[string]interface{}{
-		"model":       client.Model,
-		"messages":    messages,
-		"temperature": client.Cfg.Temperature, // Use configured temperature
+		"model":    client.Model,
+		"messages": messages,
+	}
+	if modelSupportsCustomTemperature(client.Model) {
+		requestBody["temperature"] = client.Cfg.Temperature
 	}
 	// OpenAI newer models use max_completion_tokens instead of max_tokens
 	if client.Provider == ProviderOpenAI {
@@ -273,8 +304,9 @@ func (client *Client) ParseMCPResponseFull(body []byte) (*LLMResponse, error) {
 	var result struct {
 		Choices []struct {
 			Message struct {
-				Content   string     `json:"content"`
-				ToolCalls []ToolCall `json:"tool_calls"`
+				Content          string     `json:"content"`
+				ReasoningContent string     `json:"reasoning_content"`
+				ToolCalls        []ToolCall `json:"tool_calls"`
 			} `json:"message"`
 		} `json:"choices"`
 		Usage struct {
@@ -305,8 +337,9 @@ func (client *Client) ParseMCPResponseFull(body []byte) (*LLMResponse, error) {
 
 	msg := result.Choices[0].Message
 	return &LLMResponse{
-		Content:   msg.Content,
-		ToolCalls: msg.ToolCalls,
+		Content:          msg.Content,
+		ReasoningContent: msg.ReasoningContent,
+		ToolCalls:        msg.ToolCalls,
 	}, nil
 }
 
@@ -330,6 +363,38 @@ func (client *Client) BuildRequest(url string, jsonData []byte) (*http.Request, 
 	client.Hooks.SetAuthHeader(req.Header)
 
 	return req, nil
+}
+
+func contextFromRequest(req *Request) context.Context {
+	if req != nil && req.Ctx != nil {
+		return req.Ctx
+	}
+	return context.Background()
+}
+
+func (client *Client) buildHTTPRequestWithContext(ctx context.Context, url string, jsonData []byte) (*http.Request, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	httpReq, err := client.Hooks.BuildRequest(url, jsonData)
+	if err != nil {
+		return nil, err
+	}
+	return httpReq.WithContext(ctx), nil
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Call single AI API call (fixed flow, cannot be overridden)
@@ -397,6 +462,13 @@ func (c *Client) BaseClient() *Client { return c }
 
 // IsRetryableError determines if error is retryable (network errors, timeouts, etc.)
 func (client *Client) IsRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var policy interface{ Retryable() bool }
+	if errors.As(err, &policy) && !policy.Retryable() {
+		return false
+	}
 	errStr := err.Error()
 	// Network errors, timeouts, EOF, etc. can be retried
 	for _, retryable := range client.Cfg.RetryableErrors {
@@ -450,7 +522,9 @@ func (client *Client) CallWithRequest(req *Request) (string, error) {
 		if attempt < maxRetries {
 			waitTime := client.Cfg.RetryWaitBase * time.Duration(attempt)
 			client.Log.Infof("⏳ Waiting %v before retry...", waitTime)
-			time.Sleep(waitTime)
+			if err := sleepWithContext(contextFromRequest(req), waitTime); err != nil {
+				return "", err
+			}
 		}
 	}
 
@@ -482,7 +556,9 @@ func (client *Client) CallWithRequestFull(req *Request) (*LLMResponse, error) {
 		}
 		if attempt < maxRetries {
 			waitTime := client.Cfg.RetryWaitBase * time.Duration(attempt)
-			time.Sleep(waitTime)
+			if err := sleepWithContext(contextFromRequest(req), waitTime); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return nil, fmt.Errorf("still failed after %d retries: %w", maxRetries, lastErr)
@@ -499,7 +575,7 @@ func (client *Client) callWithRequestFull(req *Request) (*LLMResponse, error) {
 	}
 
 	url := client.Hooks.BuildUrl()
-	httpReq, err := client.Hooks.BuildRequest(url, jsonData)
+	httpReq, err := client.buildHTTPRequestWithContext(contextFromRequest(req), url, jsonData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -537,7 +613,7 @@ func (client *Client) callWithRequest(req *Request) (string, error) {
 	url := client.Hooks.BuildUrl()
 	client.Log.Infof("📡 [MCP %s] Request URL: %s", client.String(), url)
 
-	httpReq, err := client.Hooks.BuildRequest(url, jsonData)
+	httpReq, err := client.buildHTTPRequestWithContext(contextFromRequest(req), url, jsonData)
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
@@ -583,6 +659,11 @@ func (client *Client) BuildRequestBodyFromRequest(req *Request) map[string]any {
 		} else {
 			m["content"] = msg.Content
 		}
+		// DeepSeek thinking models require reasoning_content to be echoed back
+		// in multi-turn conversations when present in assistant messages.
+		if msg.ReasoningContent != "" {
+			m["reasoning_content"] = msg.ReasoningContent
+		}
 		messages = append(messages, m)
 	}
 
@@ -607,11 +688,13 @@ func (client *Client) BuildRequestBodyFromRequest(req *Request) map[string]any {
 	}
 
 	// Add optional parameters (only add non-nil parameters)
-	if req.Temperature != nil {
-		requestBody["temperature"] = *req.Temperature
-	} else {
-		// If not set in Request, use Client's configuration
-		requestBody["temperature"] = client.Cfg.Temperature
+	if modelSupportsCustomTemperature(req.Model) {
+		if req.Temperature != nil {
+			requestBody["temperature"] = *req.Temperature
+		} else {
+			// If not set in Request, use Client's configuration
+			requestBody["temperature"] = client.Cfg.Temperature
+		}
 	}
 
 	// OpenAI newer models use max_completion_tokens instead of max_tokens
@@ -679,7 +762,7 @@ func (client *Client) CallWithRequestStream(req *Request, onChunk func(string)) 
 	}
 
 	url := client.Hooks.BuildUrl()
-	httpReq, err := client.Hooks.BuildRequest(url, jsonData)
+	httpReq, err := client.buildHTTPRequestWithContext(contextFromRequest(req), url, jsonData)
 	if err != nil {
 		return "", err
 	}
@@ -687,7 +770,7 @@ func (client *Client) CallWithRequestStream(req *Request, onChunk func(string)) 
 	// Idle-timeout watchdog: cancel the request if no SSE line arrives for 60 seconds.
 	// This breaks the scanner out of an indefinitely blocking Read on a hung connection.
 	const idleTimeout = 60 * time.Second
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(contextFromRequest(req))
 	defer cancel()
 	resetCh := make(chan struct{}, 1)
 	go func() {
@@ -735,8 +818,36 @@ func (client *Client) CallWithRequestStream(req *Request, onChunk func(string)) 
 	return text, err
 }
 
+type sseStreamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
+		} `json:"delta"`
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+		Text         string  `json:"text"`
+		FinishReason *string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage,omitempty"`
+}
+
+func sseData(line string) (string, bool) {
+	if !strings.HasPrefix(line, "data:") {
+		return "", false
+	}
+	// The optional space after ':' is not required by the SSE specification.
+	return strings.TrimSpace(strings.TrimPrefix(line, "data:")), true
+}
+
 // ParseSSEStream reads an SSE response body, accumulates text deltas,
 // and calls onChunk with the full accumulated text after each chunk.
+// It accepts OpenAI delta chunks, final message chunks, and legacy text chunks.
 // If onLine is non-nil, it is called after each raw SSE line is scanned
 // (useful for resetting idle-timeout watchdogs).
 // Returns the complete accumulated text and any parsed token usage (nil if absent).
@@ -744,38 +855,29 @@ func ParseSSEStream(body io.Reader, onChunk func(string), onLine func()) (string
 	var accumulated strings.Builder
 	var usage *TokenUsage
 	scanner := bufio.NewScanner(body)
+	// Scanner defaults to 64 KiB. Some gateways put a complete final response
+	// on one SSE line, so allow a bounded large event instead of dropping it.
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
 
-	for scanner.Scan() {
-		if onLine != nil {
-			onLine()
+	var eventData []string
+	completed := false
+	finishSeen := false
+	var parseErr error
+	processEvent := func() {
+		if len(eventData) == 0 || completed || parseErr != nil {
+			return
 		}
-
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
+		data := strings.Join(eventData, "\n")
+		eventData = eventData[:0]
+		if strings.TrimSpace(data) == "[DONE]" {
+			completed = true
+			return
 		}
-		data := strings.TrimPrefix(line, "data: ")
-		if data == "[DONE]" {
-			break
-		}
-
-		var chunk struct {
-			Choices []struct {
-				Delta struct {
-					Content string `json:"content"`
-				} `json:"delta"`
-				FinishReason *string `json:"finish_reason"`
-			} `json:"choices"`
-			Usage *struct {
-				PromptTokens     int `json:"prompt_tokens"`
-				CompletionTokens int `json:"completion_tokens"`
-				TotalTokens      int `json:"total_tokens"`
-			} `json:"usage,omitempty"`
-		}
+		var chunk sseStreamChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			continue // skip malformed chunks
+			parseErr = fmt.Errorf("malformed SSE data event: %w", err)
+			return
 		}
-
 		if chunk.Usage != nil && chunk.Usage.TotalTokens > 0 {
 			usage = &TokenUsage{
 				PromptTokens:     chunk.Usage.PromptTokens,
@@ -783,27 +885,109 @@ func ParseSSEStream(body io.Reader, onChunk func(string), onLine func()) (string
 				TotalTokens:      chunk.Usage.TotalTokens,
 			}
 		}
-
 		if len(chunk.Choices) == 0 {
-			continue
+			return
 		}
-
-		delta := chunk.Choices[0].Delta.Content
-		if delta == "" {
-			continue
+		choice := chunk.Choices[0]
+		if choice.FinishReason != nil {
+			// Usage-only events commonly follow the finish chunk. Keep parsing
+			// until [DONE]/EOF so settled token usage is not discarded.
+			finishSeen = true
 		}
-
-		accumulated.WriteString(delta)
+		switch {
+		case choice.Delta.Content != "":
+			accumulated.WriteString(choice.Delta.Content)
+		case choice.Message.Content != "":
+			accumulated.Reset()
+			accumulated.WriteString(choice.Message.Content)
+		case choice.Text != "":
+			accumulated.WriteString(choice.Text)
+		default:
+			return
+		}
 		if onChunk != nil {
 			onChunk(accumulated.String())
 		}
 	}
 
+	for scanner.Scan() {
+		if onLine != nil {
+			onLine()
+		}
+		line := scanner.Text()
+		if line == "" {
+			processEvent()
+			if completed || parseErr != nil {
+				break
+			}
+			continue
+		}
+		if data, ok := sseData(line); ok {
+			eventData = append(eventData, data)
+		}
+	}
+	processEvent()
+
 	if err := scanner.Err(); err != nil {
 		return accumulated.String(), usage, fmt.Errorf("stream interrupted: %w", err)
 	}
+	if parseErr != nil {
+		return accumulated.String(), usage, parseErr
+	}
+	if !completed && !finishSeen {
+		return accumulated.String(), usage, fmt.Errorf("stream ended without a completion marker")
+	}
 
 	return accumulated.String(), usage, nil
+}
+
+// DescribeSSEBody returns bounded, content-free diagnostics for an SSE body.
+// It intentionally reports only shape counters so prompts and model output are
+// never copied into logs or errors.
+func DescribeSSEBody(body []byte) string {
+	var lines, dataLines, jsonLines, malformed, choices int
+	var contentChunks, reasoningChunks, messageChunks, textChunks int
+	var done bool
+	scanner := bufio.NewScanner(bytes.NewReader(body))
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	for scanner.Scan() {
+		lines++
+		data, ok := sseData(scanner.Text())
+		if !ok {
+			continue
+		}
+		dataLines++
+		if data == "[DONE]" {
+			done = true
+			continue
+		}
+		var chunk sseStreamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			malformed++
+			continue
+		}
+		jsonLines++
+		choices += len(chunk.Choices)
+		for _, choice := range chunk.Choices {
+			if choice.Delta.Content != "" {
+				contentChunks++
+			}
+			if choice.Delta.ReasoningContent != "" {
+				reasoningChunks++
+			}
+			if choice.Message.Content != "" {
+				messageChunks++
+			}
+			if choice.Text != "" {
+				textChunks++
+			}
+		}
+	}
+	if scanner.Err() != nil {
+		malformed++
+	}
+	return fmt.Sprintf("lines=%d, data_lines=%d, json_lines=%d, malformed=%d, choices=%d, content_chunks=%d, reasoning_chunks=%d, message_chunks=%d, text_chunks=%d, done=%t",
+		lines, dataLines, jsonLines, malformed, choices, contentChunks, reasoningChunks, messageChunks, textChunks, done)
 }
 
 // ReportStreamUsage fires TokenUsageCallback with the given usage, provider, and model.

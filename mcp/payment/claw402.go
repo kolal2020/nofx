@@ -2,6 +2,7 @@ package payment
 
 import (
 	"crypto/ecdsa"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -10,20 +11,10 @@ import (
 
 	"nofx/mcp"
 	"nofx/mcp/provider"
-	"nofx/store"
-	"nofx/wallet"
-)
-
-// Per-call cost buffers for preflight. Reasoner models emit long chain-of-thought
-// tokens whose cost can far exceed the flat per-call estimate in store.GetModelPrice,
-// so they use a larger multiplier.
-const (
-	preflightSafetyMultiplier         = 1.5
-	preflightReasonerSafetyMultiplier = 4.0
 )
 
 // ErrInsufficientFunds is returned when the claw402 wallet does not hold
-// enough USDC to cover the estimated cost of a call. Callers can type-assert
+// enough USDC to cover the live quoted ceiling. Callers can type-assert
 // to surface balance/needed/address to the UI.
 type ErrInsufficientFunds struct {
 	Address string
@@ -34,10 +25,12 @@ type ErrInsufficientFunds struct {
 
 func (e *ErrInsufficientFunds) Error() string {
 	return fmt.Sprintf(
-		"claw402 insufficient USDC: wallet=%s balance=$%.4f needed=$%.4f model=%s",
+		"claw402 insufficient Base USDC: wallet=%s balance=$%.6f quoted_ceiling=$%.6f model=%s; fund the fee wallet with Base USDC (not ETH); no payment submitted",
 		shortAddr(e.Address), e.Balance, e.Needed, e.Model,
 	)
 }
+
+func (e *ErrInsufficientFunds) Retryable() bool { return false }
 
 // shortAddr renders 0x1234…abcd for log/error strings that may leak into
 // telemetry bundles. The full address stays on the struct for programmatic use.
@@ -50,37 +43,36 @@ func shortAddr(addr string) string {
 
 const (
 	DefaultClaw402URL   = "https://claw402.ai"
-	DefaultClaw402Model = "deepseek-v4-flash"
+	DefaultClaw402Model = "gpt-5.6"
 )
 
 // claw402ModelEndpoints maps user-friendly model names to claw402 API paths.
+// Must stay in sync with the claw402 catalog (GET /api/v1/catalog).
 var claw402ModelEndpoints = map[string]string{
 	// OpenAI
-	"gpt-5.4":     "/api/v1/ai/openai/chat/5.4",
-	"gpt-5.4-pro": "/api/v1/ai/openai/chat/5.4-pro",
-	"gpt-5.3":     "/api/v1/ai/openai/chat/5.3",
-	"gpt-5-mini":  "/api/v1/ai/openai/chat/5-mini",
+	"gpt-6":         "/api/v1/ai/openai/chat/6",
+	"gpt6":          "/api/v1/ai/openai/chat/6",
+	"gpt-6-astra":   "/api/v1/ai/openai/chat/6",
+	"gpt-6.1-sol":   "/api/v1/ai/openai/chat/6.1-sol",
+	"gpt-6-sol":     "/api/v1/ai/openai/chat/6-sol",
+	"gpt-6-luna":    "/api/v1/ai/openai/chat/6-luna",
+	"gpt-5.6":       "/api/v1/ai/openai/chat/5.6",
+	"gpt-5.6-sol":   "/api/v1/ai/openai/chat/5.6",
+	"gpt-5.6-terra": "/api/v1/ai/openai/chat/5.6-terra",
+	"gpt-5.6-luna":  "/api/v1/ai/openai/chat/5.6-luna",
 	// Anthropic
-	"claude-opus": "/api/v1/ai/anthropic/messages/opus",
+	"claude-fable":    "/api/v1/ai/anthropic/messages/fable",
+	"claude-fable-5":  "/api/v1/ai/anthropic/messages/fable",
+	"claude-opus":     "/api/v1/ai/anthropic/messages/opus",
+	"claude-opus-4-8": "/api/v1/ai/anthropic/messages/opus",
 	// DeepSeek
-	"deepseek":          "/api/v1/ai/deepseek/chat",
-	"deepseek-reasoner": "/api/v1/ai/deepseek/chat/reasoner",
+	"deepseek":          "/api/v1/ai/deepseek/v4-flash",
+	"deepseek-flash":    "/api/v1/ai/deepseek/v4-flash",
+	"deepseek-reasoner": "/api/v1/ai/deepseek/v4-pro",
 	"deepseek-v4-flash": "/api/v1/ai/deepseek/v4-flash",
 	"deepseek-v4-pro":   "/api/v1/ai/deepseek/v4-pro",
-	// Qwen
-	"qwen-max":   "/api/v1/ai/qwen/chat/max",
-	"qwen-plus":  "/api/v1/ai/qwen/chat/plus",
-	"qwen-turbo": "/api/v1/ai/qwen/chat/turbo",
-	"qwen-flash": "/api/v1/ai/qwen/chat/flash",
-	// Grok
-	"grok-4.1": "/api/v1/ai/grok/chat/4.1",
-	// Gemini
-	"gemini-3.1-pro": "/api/v1/ai/gemini/chat/3.1-pro",
-	// Kimi
-	"kimi-k2.5": "/api/v1/ai/kimi/chat/k2.5",
-	// Z.AI (智谱)
-	"glm-5":       "/api/v1/ai/zhipu/chat",
-	"glm-5-turbo": "/api/v1/ai/zhipu/chat/turbo",
+	// Z.AI (Zhipu)
+	"glm-5": "/api/v1/ai/zhipu/chat",
 }
 
 func init() {
@@ -99,6 +91,15 @@ type Claw402Client struct {
 }
 
 func (c *Claw402Client) BaseClient() *mcp.Client { return c.Client }
+
+// LastCallCostUSD reports only independently verified settlement amounts.
+// Token estimates and gateway headers alone are not money movement evidence.
+func (c *Claw402Client) LastCallCostUSD() (float64, bool) {
+	if c.Client.LastCallSettlementVerified {
+		return c.Client.LastCallSettledUSD, true
+	}
+	return 0, false
+}
 
 // NewClaw402Client creates a claw402 client (backward compatible).
 func NewClaw402Client() mcp.AIClient {
@@ -126,13 +127,20 @@ func NewClaw402ClientWithOptions(opts ...mcp.ClientOption) mcp.AIClient {
 
 // SetAPIKey stores the EVM private key and selects the model endpoint.
 func (c *Claw402Client) SetAPIKey(apiKey string, _ string, customModel string) {
-	hexKey := strings.TrimPrefix(apiKey, "0x")
+	// Clear first so a malformed rotation can never keep spending from the
+	// previously configured wallet.
+	c.privateKey = nil
+	c.APIKey = ""
+	hexKey := strings.TrimSpace(apiKey)
+	if len(hexKey) >= 2 && strings.EqualFold(hexKey[:2], "0x") {
+		hexKey = hexKey[2:]
+	}
 	privKey, err := crypto.HexToECDSA(hexKey)
 	if err != nil {
 		c.Log.Warnf("⚠️  [MCP] Claw402: invalid private key: %v", err)
 	} else {
 		c.privateKey = privKey
-		c.APIKey = apiKey
+		c.APIKey = hexKey
 		addr := crypto.PubkeyToAddress(privKey.PublicKey).Hex()
 		c.Log.Infof("🔧 [MCP] Claw402 wallet: %s", addr)
 	}
@@ -161,22 +169,30 @@ func (c *Claw402Client) resolveEndpoint() string {
 	if strings.HasPrefix(c.Model, "/api/") {
 		return c.Model
 	}
-	return claw402ModelEndpoints[DefaultClaw402Model]
+	return ""
 }
 
 func (c *Claw402Client) SetAuthHeader(h http.Header) { X402SetAuthHeader(h) }
 
+// Discovery already retries safely. Repeating an entire inference after a
+// signed request or a broken stream would create another spending permission.
+func (c *Claw402Client) IsRetryableError(error) bool { return false }
+
 func (c *Claw402Client) Call(systemPrompt, userPrompt string) (string, error) {
-	if err := c.preflightBalance(); err != nil {
-		return "", err
+	if c.resolveEndpoint() == "" {
+		return "", fmt.Errorf("unsupported Claw402 model %q; select a model listed in the gateway catalog; no payment submitted", c.Model)
 	}
+	unlock := lockFeeWallet(c.walletAddress())
+	defer unlock()
 	return X402CallStream(c.Client, c.signPayment, "Claw402", systemPrompt, userPrompt, nil)
 }
 
 func (c *Claw402Client) CallWithRequestFull(req *mcp.Request) (*mcp.LLMResponse, error) {
-	if err := c.preflightBalance(); err != nil {
-		return nil, err
+	if c.resolveEndpoint() == "" {
+		return nil, fmt.Errorf("unsupported Claw402 model %q; select a model listed in the gateway catalog; no payment submitted", c.Model)
 	}
+	unlock := lockFeeWallet(c.walletAddress())
+	defer unlock()
 	return X402CallFull(c.Client, c.signPayment, "Claw402", req)
 }
 
@@ -189,38 +205,31 @@ func (c *Claw402Client) walletAddress() string {
 	return crypto.PubkeyToAddress(c.privateKey.PublicKey).Hex()
 }
 
-// preflightBalance short-circuits a call when the wallet cannot cover the
-// estimated cost. RPC failures fall through — x402 will still reject an
-// actually-empty wallet, so we prefer availability over extra strictness.
-func (c *Claw402Client) preflightBalance() error {
-	addr := c.walletAddress()
-	if addr == "" {
-		return nil
-	}
-	balance, err := wallet.QueryUSDCBalanceCached(addr)
-	if err != nil {
-		c.Log.Warnf("⚠️  [MCP] Claw402 balance preflight skipped (RPC error): %v", err)
-		return nil
-	}
-	multiplier := preflightSafetyMultiplier
-	if strings.Contains(strings.ToLower(c.Model), "reasoner") {
-		multiplier = preflightReasonerSafetyMultiplier
-	}
-	needed := store.GetModelPrice(c.Model) * multiplier
-	if balance < needed {
-		return &ErrInsufficientFunds{
-			Address: addr,
-			Balance: balance,
-			Needed:  needed,
-			Model:   c.Model,
-		}
-	}
-	return nil
-}
-
-// signPayment signs x402 v2 EIP-712 payment on Base chain + USDC.
+// signPayment requires usage settlement for model calls. It never silently
+// downgrades to a full-ceiling exact charge or sends approval transactions.
+// Insufficient allowance uses a bounded, gas-sponsored off-chain permit.
 func (c *Claw402Client) signPayment(paymentHeaderB64 string) (string, error) {
-	return SignBasePaymentHeader(c.privateKey, paymentHeaderB64, "Claw402")
+	if c.privateKey == nil {
+		return "", fmt.Errorf("Claw402 fee wallet is not configured")
+	}
+	raw, err := X402DecodeHeader(paymentHeaderB64)
+	if err != nil {
+		return "", err
+	}
+	var required X402v2PaymentRequired
+	if err = json.Unmarshal(raw, &required); err != nil {
+		return "", err
+	}
+	if required.X402Version != 2 {
+		return "", fmt.Errorf("unsupported x402 payment version")
+	}
+	for _, option := range required.Accepts {
+		if option.Scheme != "upto" || option.Network != BaseNetwork {
+			continue
+		}
+		return signSponsoredPayment(c.privateKey, c.walletAddress(), option, required)
+	}
+	return "", fmt.Errorf("Claw402 model requires native Permit2 upto; refusing fixed-price fallback")
 }
 
 // ── Format overrides for Anthropic endpoints ─────────────────────────────────
@@ -231,7 +240,8 @@ func (c *Claw402Client) signPayment(paymentHeaderB64 string) (string, error) {
 // token_max_out_cap). Sending a small max_tokens here on a thinking model
 // (Kimi K2.5, DeepSeek R1/V4) caused reasoning tokens to consume the entire
 // budget and left `delta.content` empty, surfacing as "no content received".
-// upto settles on real usage, so removing the cap costs nothing extra.
+// The live gateway ceiling is checked against the wallet balance before signing;
+// upto charges actual usage, which can increase when more output is allowed.
 func stripMaxTokens(body map[string]any) map[string]any {
 	if body == nil {
 		return body
@@ -241,18 +251,34 @@ func stripMaxTokens(body map[string]any) map[string]any {
 	return body
 }
 
+// applyClawModelControls prevents DeepSeek V4 from spending the gateway's
+// entire output allowance on reasoning_content and returning no final answer.
+// The gateway accepts the standard thinking control on these V4 routes.
+func applyClawModelControls(body map[string]any, model string) map[string]any {
+	if body == nil {
+		return body
+	}
+	switch model {
+	case "deepseek", "deepseek-flash", "deepseek-reasoner", "deepseek-v4-flash", "deepseek-v4-pro":
+		body["thinking"] = map[string]any{"type": "disabled"}
+	}
+	return body
+}
+
 func (c *Claw402Client) BuildMCPRequestBody(systemPrompt, userPrompt string) map[string]any {
 	if c.claudeProxy != nil {
 		return c.claudeProxy.BuildMCPRequestBody(systemPrompt, userPrompt)
 	}
-	return stripMaxTokens(c.Client.BuildMCPRequestBody(systemPrompt, userPrompt))
+	body := stripMaxTokens(c.Client.BuildMCPRequestBody(systemPrompt, userPrompt))
+	return applyClawModelControls(body, c.Model)
 }
 
 func (c *Claw402Client) BuildRequestBodyFromRequest(req *mcp.Request) map[string]any {
 	if c.claudeProxy != nil {
 		return c.claudeProxy.BuildRequestBodyFromRequest(req)
 	}
-	return stripMaxTokens(c.Client.BuildRequestBodyFromRequest(req))
+	body := stripMaxTokens(c.Client.BuildRequestBodyFromRequest(req))
+	return applyClawModelControls(body, c.Model)
 }
 
 func (c *Claw402Client) ParseMCPResponse(body []byte) (string, error) {
